@@ -132,6 +132,20 @@ The QML window can close while the daemon continues playback or active downloads
 | **Mini-player** | A separate compact Ryoku surface with its own exact Hyprland title and independent geometry |
 | **Integrations** | MPRIS, hardware media keys, tray, Last.fm, configurable Discord Rich Presence and optional Listen Together |
 
+---
+
+### Spotify free account support (metadata-only mode)
+
+Ryotunes now supports Spotify **free (non-Premium) accounts** via a metadata-only mode with YouTube Music fallback:
+
+- **Settings → Providers** → select **Spotify** → enable **"Spotify metadata-only mode (free accounts)"**
+- OAuth uses metadata scopes only (no `streaming` scope) — works with free accounts
+- Browse/search: full Spotify catalogue (search, library, playlists, artist/album pages)
+- Playback: each Spotify track resolves via YouTube Music automatically (duration-verified match)
+- Premium users: keep metadata-only **off** for direct Spotify streaming via librespot
+
+This requires a Spotify sign-in. The setting persists across restarts.
+
 ### Home in the primary QML client
 
 - **Continue listening** resumes the queue restored by the daemon; reopening does not start playback automatically.
