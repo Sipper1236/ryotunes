@@ -17,6 +17,9 @@ use crate::credentials;
 pub struct SpotifyConfig {
     pub client_id: String,
     pub redirect_uri: String,
+    /// When true, uses metadata-only scopes (no streaming) and skips the Premium check.
+    /// Allows free accounts to browse the catalog but not stream audio directly.
+    pub metadata_only: bool,
 }
 
 impl Default for SpotifyConfig {
@@ -24,6 +27,7 @@ impl Default for SpotifyConfig {
         Self {
             client_id: auth::DEFAULT_CLIENT_ID.to_owned(),
             redirect_uri: auth::DEFAULT_REDIRECT_URI.to_owned(),
+            metadata_only: false,
         }
     }
 }
@@ -49,6 +53,7 @@ impl SpotifyProvider {
                 client_id: config.client_id,
                 redirect_uri: config.redirect_uri,
                 cache_dir,
+                metadata_only: config.metadata_only,
             },
         }
     }
@@ -61,20 +66,20 @@ impl SpotifyProvider {
     /// Restore a client from cached credentials. `Ok(None)` when nothing is cached.
     pub async fn restore(&self) -> Result<Option<Client>> {
         match auth::restore(&self.auth).await? {
-            Some(session) => Ok(Some(Client::new(session)?)),
+            Some(session) => Ok(Some(Client::new(session, self.auth.metadata_only)?)),
             None => Ok(None),
         }
     }
 
     /// Run the OAuth authorization-code flow. `on_url` receives the authorization URL to open (the
     /// daemon hands it to the client); this then completes the exchange and returns a signed-in
-    /// client. Requires a Spotify Premium account.
+    /// client. Requires a Spotify Premium account unless `metadata_only` is true.
     pub async fn sign_in<F>(&self, on_url: F) -> Result<Client>
     where
         F: FnOnce(String) + Send + 'static,
     {
         let session = auth::sign_in(&self.auth, on_url).await?;
-        Client::new(session)
+        Client::new(session, self.auth.metadata_only)
     }
 
     /// Forget the cached credentials.

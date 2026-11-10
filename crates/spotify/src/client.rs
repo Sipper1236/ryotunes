@@ -33,14 +33,19 @@ pub struct SearchResults {
 
 pub struct Client {
     session: Session,
-    engine: stream::Engine,
+    engine: Option<stream::Engine>,
+    metadata_only: bool,
 }
 
 impl Client {
-    pub(crate) fn new(session: Session) -> Result<Self> {
-        let engine = stream::Engine::new(session.clone())
-            .context("cannot start the Spotify playback engine")?;
-        Ok(Self { session, engine })
+    pub(crate) fn new(session: Session, metadata_only: bool) -> Result<Self> {
+        let engine = if metadata_only {
+            None
+        } else {
+            Some(stream::Engine::new(session.clone())
+                .context("cannot start the Spotify playback engine")?)
+        };
+        Ok(Self { session, engine, metadata_only })
     }
 
     /// The underlying librespot session, for callers that need it directly.
@@ -51,6 +56,11 @@ impl Client {
     /// Whether the session is still connected.
     pub fn alive(&self) -> bool {
         !self.session.is_invalid()
+    }
+
+    /// Whether this client is in metadata-only mode (free account, no streaming).
+    pub fn is_metadata_only(&self) -> bool {
+        self.metadata_only
     }
 
     /// A public `open.spotify.com` URL for a piece of media.
@@ -67,8 +77,15 @@ impl Client {
     // -- Playback -----------------------------------------------------------------------------
 
     /// Start streaming `track_id` (bare id or `spotify:track:` URI) through the FIFO mpv reads.
+    /// Returns an error if the client is in metadata-only mode (free account).
     pub fn stream(&self, track_id: &str) -> Result<StreamHandle> {
-        self.engine.stream(track_id)
+        if self.metadata_only {
+            anyhow::bail!("Cannot stream audio in metadata-only mode (free account). Use YouTube Music fallback.");
+        }
+        self.engine
+            .as_ref()
+            .context("Playback engine not available in metadata-only mode")?
+            .stream(track_id)
     }
 
     // -- Profile / library --------------------------------------------------------------------

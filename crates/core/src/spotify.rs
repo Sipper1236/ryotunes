@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use ryotunes_spotify::{Client, SpotifyProvider};
+use ryotunes_spotify::{Client, SpotifyProvider, SpotifyConfig, DEFAULT_CLIENT_ID, DEFAULT_REDIRECT_URI};
 use tokio::sync::RwLock;
 
 /// Which catalogue the browsing commands (search, home, library, album, artist, playlist) read
@@ -137,17 +137,25 @@ pub struct SpotifyState {
     /// connect against the same cached credentials while the startup restore is mid-flight.
     recover_lock: tokio::sync::Mutex<()>,
     selected: parking_lot::RwLock<Provider>,
+    /// When true, the provider operates in metadata-only mode (free account).
+    metadata_only: bool,
 }
 
 impl SpotifyState {
-    pub fn new(data_dir: PathBuf, selected: Provider) -> Self {
+    pub fn new(data_dir: PathBuf, selected: Provider, metadata_only: bool) -> Self {
+        let config = SpotifyConfig {
+            client_id: DEFAULT_CLIENT_ID.to_owned(),
+            redirect_uri: DEFAULT_REDIRECT_URI.to_owned(),
+            metadata_only,
+        };
         Self {
-            provider: SpotifyProvider::new(data_dir),
+            provider: SpotifyProvider::with_config(data_dir, config),
             client: RwLock::new(None),
             last_recovery: parking_lot::Mutex::new(None),
             refused: std::sync::atomic::AtomicBool::new(false),
             recover_lock: tokio::sync::Mutex::new(()),
             selected: parking_lot::RwLock::new(selected),
+            metadata_only,
         }
     }
 
@@ -181,6 +189,11 @@ impl SpotifyState {
     /// Whether a credential file exists to restore from (no network).
     pub fn stored(&self) -> bool {
         self.provider.stored()
+    }
+
+    /// Whether the provider is in metadata-only mode (free account).
+    pub fn is_metadata_only(&self) -> bool {
+        self.metadata_only
     }
 
     /// Whether a usable client exists.
@@ -315,7 +328,7 @@ mod tests {
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join("credentials.json"), b"{").unwrap();
 
-        let state = SpotifyState::new(dir.path().to_path_buf(), Provider::Spotify);
+        let state = SpotifyState::new(dir.path().to_path_buf(), Provider::Spotify, false);
         assert!(state.stored());
         assert!(state.client().await.is_none());
         assert!(!state.may_recover());

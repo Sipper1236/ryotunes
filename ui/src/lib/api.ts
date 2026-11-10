@@ -380,6 +380,12 @@ export interface DiscordStatus { enabled: boolean; status: 'disabled' | 'connect
 export const discordStatus = () => invoke<DiscordStatus>('discord_status');
 /** Streamable client keys for the "disabled clients" setting. */
 export const getStreamClients = () => invoke<string[]>('get_stream_clients');
+/** Current active music provider. */
+export interface ProviderInfo { provider: 'youtube' | 'spotify' | 'soundcloud' | 'tidal'; }
+export const getProvider = () => invoke<ProviderInfo>('get_provider');
+/** Switch the active music provider. */
+export const setProvider = (provider: 'youtube' | 'spotify' | 'soundcloud' | 'tidal') =>
+	invoke<ProviderInfo>('set_provider', { provider });
 /** Force-clear every playback cache; `rotate` (default true) also re-bootstraps the YouTube visitorData. */
 export const clearCaches = (rotate = true) =>
 	invoke<{ visitorDataRefreshed: boolean }>('clear_caches', { rotate });

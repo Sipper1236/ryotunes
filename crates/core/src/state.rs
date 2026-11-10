@@ -65,7 +65,7 @@ pub const TIDAL_CREDENTIALS_KEY: &str = "tidal_credentials";
 /// into the renderer: they'd otherwise ship the login credential out on every open, and the
 /// renderer can't overwrite them either. Lives here so `settings_snapshot`, the Tauri host and the
 /// daemon share one list.
-pub const UI_SETTINGS: [&str; 15] = [
+pub const UI_SETTINGS: [&str; 16] = [
     "volume",
     "proxy",
     "quality",
@@ -81,6 +81,7 @@ pub const UI_SETTINGS: [&str; 15] = [
     "lyrics_romanize",
     "ui_scale",
     "low_resource_mode",
+    "spotify_metadata_only",
 ];
 
 /// Where the personal store (Home Shortcuts, sidebar pins, play recency, Home arrangement) lives:
@@ -436,8 +437,13 @@ impl AppState {
             .as_deref()
             .and_then(crate::spotify::Provider::parse)
             .unwrap_or(crate::spotify::Provider::Youtube);
+        let metadata_only = db.get_setting("spotify_metadata_only").as_deref() == Some("true");
         let spotify =
-            Arc::new(crate::spotify::SpotifyState::new(paths.data_dir.join("spotify"), selected));
+            Arc::new(crate::spotify::SpotifyState::new(
+                paths.data_dir.join("spotify"),
+                selected,
+                metadata_only,
+            ));
         let soundcloud =
             Arc::new(ryotunes_soundcloud::SoundCloud::new(paths.data_dir.join("soundcloud")));
         // A captured SoundCloud sign-in survives restarts like the YouTube cookie does: the
@@ -962,6 +968,10 @@ impl AppState {
                     "Sign in to Spotify to play this".to_owned(),
                 ));
             };
+            // If in metadata-only mode (free account), search YouTube Music for the track instead.
+            if self.spotify.is_metadata_only() {
+                return self.resolve_spotify_via_youtube(tid, video_id).await;
+            }
             let handle = client
                 .stream(tid)
                 .map_err(|e| ResolveError::AllClientsFailed(format!("{video_id}: {e}")))?;
@@ -1161,6 +1171,92 @@ impl AppState {
             );
         }
         Ok(data)
+    }
+
+    /// Resolve a Spotify track via YouTube Music search (metadata-only mode for free accounts).
+    /// Fetches the track metadata from Spotify, searches YouTube Music, and returns YouTube playback data.
+    async fn resolve_spotify_via_youtube(
+        self: &std::sync::Arc<Self>,
+        spotify_track_id: &str,
+        original_video_id: &str,
+    ) -> Result<PlaybackData, ResolveError> {
+        let client = self
+            .spotify
+            .client()
+            .await
+            .ok_or_else(|| ResolveError::SignInRequired("Sign in to Spotify to play this".to_owned()))?;
+
+        // Fetch track metadata from Spotify
+        let track = client
+            .track(spotify_track_id)
+            .await
+            .map_err(|e| ResolveError::AllClientsFailed(format!("{original_video_id}: {e}")))?;
+
+        // Build search query: "track_name artist1 artist2"
+        let search_query = if !track.artists.is_empty() {
+            format!("{} {}", track.name, track.artists)
+        } else {
+            track.name.clone()
+        };
+
+        tracing::info!(spotify_track_id = %spotify_track_id, query = %search_query, "Resolving Spotify track via YouTube Music fallback");
+
+        // Search YouTube Music
+        let results = self
+            .orchestrator
+            .resolve(
+                &search_query,
+                false,
+                self.quality(),
+                &self.disabled_clients(),
+            )
+            .await;
+
+        match results {
+            Ok(playback_data) => {
+                // Verify duration proximity (within 10 seconds) to reduce wrong-match risk
+                let expected_ms = track.duration.as_millis() as i64;
+                if expected_ms > 0 {
+                    if let Some(yt_duration_str) = &playback_data.duration {
+                        let actual_ms = parse_duration_ms(Some(yt_duration_str));
+                        if actual_ms > 0 {
+                            let diff = (expected_ms - actual_ms).abs();
+                            if diff > 10_000 {
+                                tracing::warn!(
+                                    spotify_track_id = %spotify_track_id,
+                                    expected_ms = expected_ms,
+                                    actual_ms = actual_ms,
+                                    "YouTube match duration differs significantly; possible wrong match"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                Ok(PlaybackData {
+                    video_id: original_video_id.to_owned(),
+                    stream_url: playback_data.stream_url,
+                    itag: playback_data.itag,
+                    mpv_options: playback_data.mpv_options,
+                    headers: playback_data.headers,
+                    expires_in_seconds: playback_data.expires_in_seconds,
+                    loudness_db: playback_data.loudness_db,
+                    playback_ping: playback_data.playback_ping,
+                    title: playback_data.title,
+                    artists: playback_data.artists,
+                    duration: playback_data.duration,
+                    thumbnail: playback_data.thumbnail,
+                    is_video: playback_data.is_video,
+                    stream_client: "youtube-fallback".to_owned(),
+                })
+            }
+            Err(e) => {
+                tracing::error!(spotify_track_id = %spotify_track_id, error = %e, "YouTube fallback search failed");
+                Err(ResolveError::AllClientsFailed(format!(
+                    "YouTube fallback for Spotify track {spotify_track_id}: {e}"
+                )))
+            }
+        }
     }
 
     /// The on-demand visitorData (re)bootstrap a bot-gated resolve triggers: fetch a fresh

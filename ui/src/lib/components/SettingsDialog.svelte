@@ -16,10 +16,11 @@
 	import { normalizeSearchText } from '$lib/localsearch';
 	import { t } from '$lib/i18n.svelte';
 
-	type TabId = 'general' | 'playback' | 'data' | 'keybinds' | 'about';
+	type TabId = 'general' | 'playback' | 'providers' | 'data' | 'keybinds' | 'about';
 	const TABS: { id: TabId; label: string }[] = [
 		{ id: 'general', label: t('General') },
 		{ id: 'playback', label: t('Playback') },
+		{ id: 'providers', label: t('Providers') },
 		{ id: 'data', label: t('Data & storage') },
 		{ id: 'keybinds', label: t('Keybinds') },
 		{ id: 'about', label: t('About') }
@@ -28,9 +29,10 @@
 	const TAB_META: Record<TabId, { jp: string; group: string; blurb: string; code: string }> = {
 		general: { jp: '全般', group: 'APPLICATION', blurb: t('Session behaviour, desktop integration and the things that should stay out of your way.'), code: 'APP-01' },
 		playback: { jp: '再生', group: 'PLAYBACK', blurb: t('How the listening engine resolves, queues and carries a session forward.'), code: 'PLAY-02' },
-		data: { jp: '保存', group: 'DATA', blurb: t('Network routing and local storage used to keep the instrument responsive.'), code: 'DATA-03' },
-		keybinds: { jp: '鍵', group: 'KEYBINDS', blurb: t('Every Ryotunes shortcut, grouped by intent and read from the same registry the app executes.'), code: 'KEY-04' },
-		about: { jp: '力', group: 'ABOUT', blurb: t('Build identity and the small set of components that make Ryotunes a Ryoku music instrument.'), code: 'INFO-05' }
+		providers: { jp: '提供', group: 'PROVIDERS', blurb: t('Choose your music source and configure each provider — YouTube Music, Spotify, SoundCloud, Tidal.'), code: 'PROV-03' },
+		data: { jp: '保存', group: 'DATA', blurb: t('Network routing and local storage used to keep the instrument responsive.'), code: 'DATA-04' },
+		keybinds: { jp: '鍵', group: 'KEYBINDS', blurb: t('Every Ryotunes shortcut, grouped by intent and read from the same registry the app executes.'), code: 'KEY-05' },
+		about: { jp: '力', group: 'ABOUT', blurb: t('Build identity and the small set of components that make Ryotunes a Ryoku music instrument.'), code: 'INFO-06' }
 	};
 
 	let tab = $state<TabId>('general');
@@ -60,9 +62,14 @@
 	let loaded = $state(false);
 	let clearing = $state(false);
 	let discordState = $state<api.DiscordStatus>({ enabled: false, status: 'disabled' });
+	// Providers tab state
+	let currentProvider = $state<'youtube' | 'spotify' | 'soundcloud' | 'tidal'>('youtube');
+	let spotifyMetadataOnly = $state(false);
+	let providersLoaded = $state(false);
 	const settingsArt = $derived.by(() => {
 		if (tab === 'general' && auth.account?.thumbnail) return thumb(auth.account.thumbnail, 384);
 		if (tab === 'playback' && playback.now?.thumbnail) return thumb(playback.now.thumbnail, 384);
+		if (tab === 'providers' && playback.now?.thumbnail) return thumb(playback.now.thumbnail, 384);
 		return '';
 	});
 	const settingsCaption = $derived.by(() => {
@@ -75,6 +82,19 @@
 			return playback.now
 				? `${playback.now.title} — ${playback.now.artists || t('Now playing')}`
 				: t('Playback engine ready. No stream is active.');
+		}
+		if (tab === 'providers') {
+			const providerLabels: Record<string, string> = {
+				youtube: t('YouTube Music'),
+				spotify: t('Spotify'),
+				soundcloud: t('SoundCloud'),
+				tidal: t('Tidal')
+			};
+			const label = providerLabels[currentProvider] || currentProvider;
+			const metaNote = currentProvider === 'spotify' && spotifyMetadataOnly
+				? ` · ${t('Metadata only — free account mode')}`
+				: '';
+			return `${t('Active provider')}: ${label}${metaNote}. ${t('Switching providers changes your music source.')}`;
 		}
 		if (tab === 'data') return t('Tape, cache and transport — the local path that keeps playback immediate.');
 		if (tab === 'keybinds') return t('Keyboard flow is part of the instrument: searchable, grouped and always in sync with the live bindings.');
@@ -95,6 +115,18 @@
 				`QUALITY|${settings.quality ?? 'HIGH'}`,
 				`SPEED|${playback.speed.toFixed(2)}×`,
 				`QUEUE|${Math.max(0, playback.queue.items.length - playback.queue.currentIndex - 1)}`
+			];
+		}
+		if (tab === 'providers') {
+			const providerLabels: Record<string, string> = {
+				youtube: 'YOUTUBE MUSIC',
+				spotify: 'SPOTIFY',
+				soundcloud: 'SOUNDCLOUD',
+				tidal: 'TIDAL'
+			};
+			return [
+				`PROVIDER|${providerLabels[currentProvider] || currentProvider.toUpperCase()}`,
+				`SPOTIFY_META|${spotifyMetadataOnly ? 'ON' : 'OFF'}`
 			];
 		}
 		if (tab === 'data') {
@@ -131,6 +163,10 @@
 		const timer = window.setInterval(refresh, 3000);
 		return () => { stopped = true; window.clearInterval(timer); };
 	});
+	$effect(() => {
+		if (!ui.settingsOpen || tab !== 'providers') return;
+		untrack(() => { loadProviders(); });
+	});
 	async function load() {
 		try {
 			const [s, c] = await Promise.all([api.getSettings(), api.getStreamClients()]);
@@ -147,6 +183,20 @@
 			toast.error(String(e));
 		}
 		loaded = true;
+	}
+
+	async function loadProviders() {
+		try {
+			const [providerRes, metaOnly] = await Promise.all([
+				api.getProvider(),
+				api.getSettings()
+			]);
+			currentProvider = providerRes.provider as 'youtube' | 'spotify' | 'soundcloud' | 'tidal';
+			spotifyMetadataOnly = metaOnly.spotify_metadata_only === 'true';
+		} catch (e) {
+			toast.error(String(e));
+		}
+		providersLoaded = true;
 	}
 
 	const quality = $derived(settings.quality ?? 'HIGH');
@@ -289,6 +339,26 @@
 		else set.add(name);
 		settings.disabled_stream_clients = [...set].join(',');
 		await api.setSetting('disabled_stream_clients', settings.disabled_stream_clients);
+	}
+
+	async function setProvider(provider: 'youtube' | 'spotify' | 'soundcloud' | 'tidal') {
+		try {
+			await api.setProvider(provider);
+			currentProvider = provider;
+			toast.success(t('Provider switched to {provider}', { provider: provider.charAt(0).toUpperCase() + provider.slice(1) }));
+		} catch (e) {
+			toast.error(String(e));
+		}
+	}
+
+	async function setSpotifyMetadataOnly(on: boolean) {
+		try {
+			await api.setSetting('spotify_metadata_only', on ? 'true' : 'false');
+			spotifyMetadataOnly = on;
+			toast.success(on ? t('Spotify metadata-only mode enabled — free account mode') : t('Spotify metadata-only mode disabled — Premium playback'));
+		} catch (e) {
+			toast.error(String(e));
+		}
 	}
 
 	async function saveProxy() {
@@ -591,8 +661,55 @@
 								</div>
 							{/each}
 						</div>
-					</div>
-				{:else if tab === 'data'}
+									</div>
+								{:else if tab === 'providers'}
+									<div class="ryo-settings-subhead"><span>// MUSIC PROVIDERS</span><b>ACTIVE</b></div>
+									<div class="border-b py-3">
+										<div class="font-medium">{t('Active provider')}</div>
+										<p class="mt-0.5 mb-3 text-sm text-muted-foreground">
+											{t('Choose which music source powers search, browse and playback. Each provider has its own catalogue and features.')}
+										</p>
+										<div class="flex flex-wrap gap-2">
+											{#each ['youtube', 'spotify', 'soundcloud', 'tidal'] as p (p)}
+												<Button
+													variant={currentProvider === p ? 'default' : 'outline'}
+													size="sm"
+													onclick={() => setProvider(p)}
+													disabled={!providersLoaded}
+												>
+													{p === 'youtube' ? 'YouTube Music' : p.charAt(0).toUpperCase() + p.slice(1)}
+												</Button>
+											{/each}
+										</div>
+										{#if currentProvider === 'spotify'}
+											<p class="mt-2 text-xs text-muted-foreground">
+												{t('Current: Spotify')} {spotifyMetadataOnly ? ' · ' + t('Metadata only (free account)') : ' · ' + t('Premium playback')}
+											</p>
+										{:else if currentProvider === 'soundcloud'}
+											<p class="mt-2 text-xs text-muted-foreground">{t('Current: SoundCloud · Public catalogue, no account needed for playback')}</p>
+										{:else if currentProvider === 'tidal'}
+											<p class="mt-2 text-xs text-muted-foreground">{t('Current: Tidal · Requires subscription for full catalogue')}</p>
+										{:else}
+											<p class="mt-2 text-xs text-muted-foreground">{t('Current: YouTube Music · Your library, playlists and recommendations')}</p>
+										{/if}
+									</div>
+									{#if currentProvider === 'spotify'}
+										<div class="flex items-start justify-between gap-4 border-b py-3">
+											<div class="min-w-0">
+												<div class="font-medium">{t('Spotify metadata-only mode (free accounts)')}</div>
+												<p class="mt-0.5 text-sm text-muted-foreground">
+													{t('Enable to use Spotify with a free (non-Premium) account. Browse the Spotify catalogue and play via YouTube Music fallback. Premium users should keep this off for direct Spotify streaming.')}
+												</p>
+											</div>
+											<Switch checked={spotifyMetadataOnly} onCheckedChange={setSpotifyMetadataOnly} disabled={!providersLoaded} />
+										</div>
+										<div class="py-3">
+											<div class="font-medium text-xs text-muted-foreground">
+												{t('Note: Metadata-only mode uses Spotify for search/browse and YouTube Music for audio. Requires Spotify sign-in.')}
+											</div>
+										</div>
+									{/if}
+								{:else if tab === 'data'}
 					<div class="border-b py-3">
 						<div class="font-medium">{t('Proxy')}</div>
 						<p class="mt-0.5 mb-3 text-sm text-muted-foreground">

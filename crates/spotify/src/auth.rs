@@ -32,7 +32,8 @@ const REDIRECT_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
 const PRODUCT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const PRODUCT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
-pub const SCOPES: &[&str] = &[
+/// Full scopes including streaming (requires Premium).
+pub const FULL_SCOPES: &[&str] = &[
     "playlist-read-collaborative",
     "playlist-read-private",
     "streaming",
@@ -44,6 +45,22 @@ pub const SCOPES: &[&str] = &[
     "user-read-recently-played",
     "user-top-read",
 ];
+
+/// Metadata-only scopes (no streaming) — works with free accounts.
+pub const METADATA_SCOPES: &[&str] = &[
+    "playlist-read-collaborative",
+    "playlist-read-private",
+    "user-follow-read",
+    "user-library-read",
+    "user-read-email",
+    "user-read-private",
+    "user-read-recently-played",
+    "user-top-read",
+];
+
+/// Scopes used by the current configuration. Kept for backward compatibility.
+#[allow(dead_code)]
+pub const SCOPES: &[&str] = FULL_SCOPES;
 
 /// Why a sign-in failed, when the reason is one the caller can act on (as opposed to a raw transport
 /// error). Lifted from Sonora's `music` crate.
@@ -83,6 +100,9 @@ pub struct AuthConfig {
     pub client_id: String,
     pub redirect_uri: String,
     pub cache_dir: PathBuf,
+    /// When true, skips the `streaming` scope and the Premium check. Allows free accounts
+    /// to access metadata (library, playlists, search) but not stream audio.
+    pub metadata_only: bool,
 }
 
 impl AuthConfig {
@@ -118,7 +138,9 @@ pub async fn restore(config: &AuthConfig) -> Result<Option<Session>> {
 
     session.connect(credentials, true).await.map_err(denied)?;
     credentials::secure(&config.file());
-    premium(&session).await?;
+    if !config.metadata_only {
+        premium(&session).await?;
+    }
     Ok(Some(session))
 }
 
@@ -134,7 +156,9 @@ where
     let session = session(config)?;
     session.connect(Credentials::with_access_token(access_token), true).await.map_err(denied)?;
     credentials::secure(&config.file());
-    premium(&session).await?;
+    if !config.metadata_only {
+        premium(&session).await?;
+    }
     Ok(session)
 }
 
@@ -154,9 +178,10 @@ where
         );
 
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+    let scopes = if config.metadata_only { METADATA_SCOPES } else { FULL_SCOPES };
     let (auth_url, _csrf) = client
         .authorize_url(CsrfToken::new_random)
-        .add_scopes(SCOPES.iter().map(|scope| Scope::new((*scope).to_owned())))
+        .add_scopes(scopes.iter().map(|scope| Scope::new((*scope).to_owned())))
         .set_pkce_challenge(challenge)
         .url();
 
@@ -351,5 +376,11 @@ mod tests {
             Some("access_denied")
         );
         assert_eq!(query_param("http://localhost/login?error=access_denied", "code"), None);
+    }
+
+    #[test]
+    fn metadata_scopes_exclude_streaming() {
+        assert!(!super::METADATA_SCOPES.iter().any(|s| *s == "streaming"));
+        assert!(super::FULL_SCOPES.iter().any(|s| *s == "streaming"));
     }
 }

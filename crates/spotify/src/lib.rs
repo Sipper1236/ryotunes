@@ -29,7 +29,7 @@ mod search;
 mod stream;
 mod wire;
 
-pub use auth::{SignInFailure, SignInProblem};
+pub use auth::{SignInFailure, SignInProblem, FULL_SCOPES, METADATA_SCOPES, DEFAULT_CLIENT_ID, DEFAULT_REDIRECT_URI};
 pub use client::{Client, SearchResults};
 pub use models::*;
 pub use provider::{SpotifyConfig, SpotifyProvider};
