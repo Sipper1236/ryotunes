@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use ryotunes_spotify::{Client, SpotifyProvider, SpotifyConfig, DEFAULT_CLIENT_ID, DEFAULT_REDIRECT_URI};
 use tokio::sync::RwLock;
 
@@ -126,9 +127,9 @@ const RECOVERY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30
 /// Owns the Spotify sign-in, the current client and the catalogue selector. Construct once with the
 /// daemon's data directory; `spotify` credentials land under `<data_dir>/spotify`.
 pub struct SpotifyState {
-    provider: SpotifyProvider,
+    provider: ParkingRwLock<Arc<SpotifyProvider>>,
     client: RwLock<Option<Arc<Client>>>,
-    last_recovery: parking_lot::Mutex<Option<std::time::Instant>>,
+    last_recovery: ParkingMutex<Option<std::time::Instant>>,
     /// Set when the stored credentials were refused for a reason no retry fixes (no Premium,
     /// out of region, revoked). Recovery then stays off until a sign-in or sign-out, instead of
     /// reconnecting librespot once per cooldown for an account that can never play.
@@ -136,9 +137,9 @@ pub struct SpotifyState {
     /// Serialises session restores so an on-demand recovery never runs a second librespot
     /// connect against the same cached credentials while the startup restore is mid-flight.
     recover_lock: tokio::sync::Mutex<()>,
-    selected: parking_lot::RwLock<Provider>,
+    selected: ParkingRwLock<Provider>,
     /// When true, the provider operates in metadata-only mode (free account).
-    metadata_only: bool,
+    metadata_only: std::sync::atomic::AtomicBool,
 }
 
 impl SpotifyState {
@@ -149,13 +150,13 @@ impl SpotifyState {
             metadata_only,
         };
         Self {
-            provider: SpotifyProvider::with_config(data_dir, config),
+            provider: ParkingRwLock::new(Arc::new(SpotifyProvider::with_config(data_dir, config))),
             client: RwLock::new(None),
-            last_recovery: parking_lot::Mutex::new(None),
+            last_recovery: ParkingMutex::new(None),
             refused: std::sync::atomic::AtomicBool::new(false),
             recover_lock: tokio::sync::Mutex::new(()),
-            selected: parking_lot::RwLock::new(selected),
-            metadata_only,
+            selected: ParkingRwLock::new(selected),
+            metadata_only: std::sync::atomic::AtomicBool::new(metadata_only),
         }
     }
 
@@ -188,12 +189,12 @@ impl SpotifyState {
 
     /// Whether a credential file exists to restore from (no network).
     pub fn stored(&self) -> bool {
-        self.provider.stored()
+        self.provider.read().stored()
     }
 
     /// Whether the provider is in metadata-only mode (free account).
     pub fn is_metadata_only(&self) -> bool {
-        self.metadata_only
+        self.metadata_only.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether a usable client exists.
@@ -206,7 +207,7 @@ impl SpotifyState {
         if let Some(client) = self.live_client().await {
             return Some(client);
         }
-        if !self.provider.stored()
+        if !self.provider.read().stored()
             || self.refused.load(std::sync::atomic::Ordering::Relaxed)
             || !self.may_recover()
         {
@@ -270,7 +271,8 @@ impl SpotifyState {
         if self.live_client().await.is_some() {
             return Ok(true);
         }
-        let restored = self.provider.restore().await.inspect_err(|e| {
+        let provider = self.provider.read().clone();
+        let restored = provider.restore().await.inspect_err(|e| {
             if retry_cannot_fix(e) {
                 self.refused.store(true, std::sync::atomic::Ordering::Relaxed);
             }
@@ -290,7 +292,8 @@ impl SpotifyState {
     where
         F: FnOnce(String) + Send + 'static,
     {
-        let client = self.provider.sign_in(on_url).await?;
+        let provider = self.provider.read().clone();
+        let client = provider.sign_in(on_url).await?;
         *self.client.write().await = Some(Arc::new(client));
         *self.last_recovery.lock() = None;
         self.refused.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -299,7 +302,27 @@ impl SpotifyState {
 
     /// Forget the cached credentials and drop the current client.
     pub async fn sign_out(&self) {
-        self.provider.sign_out();
+        let provider = self.provider.read().clone();
+        provider.sign_out();
+        *self.client.write().await = None;
+        *self.last_recovery.lock() = None;
+        self.refused.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Update the metadata-only mode and force a re-restore with the new setting.
+    /// Call this when the user toggles the "Spotify free account (metadata only)" setting.
+    pub async fn set_metadata_only(&self, metadata_only: bool) {
+        let current = self.metadata_only.load(std::sync::atomic::Ordering::Relaxed);
+        if current == metadata_only {
+            return;
+        }
+        self.metadata_only.store(metadata_only, std::sync::atomic::Ordering::Relaxed);
+        // Update the provider's auth config so future restores/sign-ins use the new mode.
+        {
+            let provider = self.provider.write().clone();
+            provider.auth.metadata_only.store(metadata_only, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Drop the current client so it gets recreated with the new mode on next use.
         *self.client.write().await = None;
         *self.last_recovery.lock() = None;
         self.refused.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -348,5 +371,45 @@ mod tests {
         assert!(!refused(SignInProblem::Network));
         assert!(!refused(SignInProblem::Refused));
         assert!(!retry_cannot_fix(&anyhow::anyhow!("Connection to server closed")));
+    }
+
+    #[test]
+    fn spotify_state_defaults_to_full_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = SpotifyState::new(dir.path().to_path_buf(), Provider::Spotify, false);
+        assert!(!state.is_metadata_only());
+    }
+
+    #[test]
+    fn spotify_state_can_be_metadata_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = SpotifyState::new(dir.path().to_path_buf(), Provider::Spotify, true);
+        assert!(state.is_metadata_only());
+    }
+
+    #[tokio::test]
+    async fn set_metadata_only_updates_flag_and_clears_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = SpotifyState::new(dir.path().to_path_buf(), Provider::Spotify, false);
+        
+        assert!(!state.is_metadata_only());
+        
+        state.set_metadata_only(true).await;
+        
+        assert!(state.is_metadata_only());
+        // Client should be cleared so it gets recreated with new mode
+        assert!(state.client().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_metadata_only_to_false_updates_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = SpotifyState::new(dir.path().to_path_buf(), Provider::Spotify, true);
+        
+        assert!(state.is_metadata_only());
+        
+        state.set_metadata_only(false).await;
+        
+        assert!(!state.is_metadata_only());
     }
 }

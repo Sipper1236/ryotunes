@@ -34,7 +34,7 @@ impl Default for SpotifyConfig {
 
 /// Owns the Spotify sign-in configuration and its on-disk credential cache. One per process.
 pub struct SpotifyProvider {
-    auth: AuthConfig,
+    pub auth: AuthConfig,
 }
 
 impl SpotifyProvider {
@@ -53,7 +53,7 @@ impl SpotifyProvider {
                 client_id: config.client_id,
                 redirect_uri: config.redirect_uri,
                 cache_dir,
-                metadata_only: config.metadata_only,
+                metadata_only: std::sync::atomic::AtomicBool::new(config.metadata_only),
             },
         }
     }
@@ -66,7 +66,7 @@ impl SpotifyProvider {
     /// Restore a client from cached credentials. `Ok(None)` when nothing is cached.
     pub async fn restore(&self) -> Result<Option<Client>> {
         match auth::restore(&self.auth).await? {
-            Some(session) => Ok(Some(Client::new(session, self.auth.metadata_only)?)),
+            Some(session) => Ok(Some(Client::new(session, self.auth.metadata_only.load(std::sync::atomic::Ordering::Relaxed))?)),
             None => Ok(None),
         }
     }
@@ -79,11 +79,52 @@ impl SpotifyProvider {
         F: FnOnce(String) + Send + 'static,
     {
         let session = auth::sign_in(&self.auth, on_url).await?;
-        Client::new(session, self.auth.metadata_only)
+        Client::new(session, self.auth.metadata_only.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Forget the cached credentials.
     pub fn sign_out(&self) {
         auth::forget(&self.auth);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn spotify_config_defaults_to_full_scopes() {
+        let config = SpotifyConfig::default();
+        assert!(!config.metadata_only);
+    }
+
+    #[test]
+    fn spotify_config_can_be_metadata_only() {
+        let config = SpotifyConfig {
+            client_id: "test".to_string(),
+            redirect_uri: "http://127.0.0.1:8989/login".to_string(),
+            metadata_only: true,
+        };
+        assert!(config.metadata_only);
+    }
+
+    #[test]
+    fn provider_with_metadata_only_config_sets_atomic_flag() {
+        let provider = SpotifyProvider::with_config(
+            PathBuf::from("/tmp/test"),
+            SpotifyConfig {
+                client_id: "test".to_string(),
+                redirect_uri: "http://127.0.0.1:8989/login".to_string(),
+                metadata_only: true,
+            },
+        );
+        assert!(provider.auth.metadata_only.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn provider_with_default_config_has_false_metadata_only() {
+        let provider = SpotifyProvider::new(PathBuf::from("/tmp/test"));
+        assert!(!provider.auth.metadata_only.load(std::sync::atomic::Ordering::Relaxed));
     }
 }

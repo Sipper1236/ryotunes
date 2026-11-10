@@ -59,16 +59,17 @@ Item {
     ]
     readonly property var uiScales: [80, 90, 100, 110, 120, 130, 140]
     readonly property var sections: [
-        { k: "general", l: "General", jp: "全般" },
-        { k: "playback", l: "Playback", jp: "再生" },
-        { k: "downloads", l: "Downloads", jp: "保存" },
-        { k: "data", l: "Data & storage", jp: "保存" },
-        { k: "account", l: "Account", jp: "鍵" },
-        { k: "local", l: "Local music", jp: "音源" },
-        { k: "playlists", l: "Playlists", jp: "転送" },
-        { k: "diagnostics", l: "Diagnostics", jp: "診" },
-        { k: "about", l: "About", jp: "力" }
-    ]
+            { k: "general", l: "General", jp: "\u5168\u822C" },
+            { k: "playback", l: "Playback", jp: "\u518D\u751F" },
+            { k: "providers", l: "Providers", jp: "\u63D0\u4F9B" },
+            { k: "downloads", l: "Downloads", jp: "\u4FDD\u5B58" },
+            { k: "data", l: "Data & storage", jp: "\u4FDD\u5B58" },
+            { k: "account", l: "Account", jp: "\u9375" },
+            { k: "local", l: "Local music", jp: "\u97F3\u6E90" },
+            { k: "playlists", l: "Playlists", jp: "\u8EE2\u9001" },
+            { k: "diagnostics", l: "Diagnostics", jp: "\u8A3A" },
+            { k: "about", l: "About", jp: "\u529B" }
+        ]
 
     Component.onCompleted: {
         page.load();
@@ -550,7 +551,7 @@ Item {
                     var h = 0;
                     if (page.section === "general") h = generalCol.implicitHeight;
                     else if (page.section === "playback") h = playbackCol.implicitHeight;
-                    else if (page.section === "data") h = dataCol.implicitHeight;
+                    else if (page.section === "providers") h = providersCol.implicitHeight;
                     else if (page.section === "downloads") h = downloadSettingsLoader.item ? downloadSettingsLoader.item.implicitHeight : 0;
                     else if (page.section === "account") h = accountCol.implicitHeight;
                     else if (page.section === "local") h = localCol.implicitHeight;
@@ -969,6 +970,53 @@ Item {
                                 onToggled: () => page.toggleClient(clientRow.modelData)
                             }
                         }
+                    }
+                }
+
+                // ─────────────────────────── PROVIDERS ───────────────────────────
+                ColumnLayout {
+                    id: providersCol
+                    visible: page.section === "providers"
+                    anchors { left: parent.left; right: parent.right; top: parent.top; leftMargin: Style.sp(6); rightMargin: Style.sp(6); topMargin: Style.sp(4) }
+                    spacing: Style.sp(3)
+
+                    SectionHeading { Layout.fillWidth: true; title: "Music provider"; mark: "提供" }
+
+                    // Provider selector — Chip set like Theme/Decor
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Style.sp(4)
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 1
+                            Text { Layout.fillWidth: true; text: "Active provider"; color: Tokens.ink; font.family: Style.fontUi; font.pixelSize: Style.fs.md; font.weight: Font.Medium; wrapMode: Text.WordWrap }
+                            Text {
+                                Layout.fillWidth: true
+                                text: "Which catalogue to search and play from. YouTube is the default; Spotify, SoundCloud and TIDAL need their own sign-in (Account section)."
+                                color: Tokens.inkMuted; font.family: Style.fontUi; font.pixelSize: Style.fs.sm; wrapMode: Text.WordWrap
+                            }
+                        }
+                        RowLayout {
+                            Layout.alignment: Qt.AlignVCenter
+                            spacing: Style.sp(2)
+                            Repeater {
+                                model: [ { p: "youtube", l: "YouTube" }, { p: "spotify", l: "Spotify" }, { p: "soundcloud", l: "SoundCloud" }, { p: "tidal", l: "TIDAL" } ]
+                                delegate: Chip {
+                                    required property var modelData
+                                    text: modelData.l
+                                    active: Playback.provider === modelData.p
+                                    onClicked: Playback.setProvider(modelData.p)
+                                }
+                            }
+                        }
+                    }
+
+                    // Spotify metadata-only toggle
+                    ToggleRow {
+                        title: "Spotify free account (metadata only)"
+                        desc: "Use Spotify for search/browse/playlists but play via YouTube Music fallback. No Premium required. When off, Spotify playback needs Premium."
+                        value: page.settings.spotify_metadata_only === "true"
+                        onFlipped: (on) => page.setSetting("spotify_metadata_only", on ? "true" : "false")
                     }
                 }
 

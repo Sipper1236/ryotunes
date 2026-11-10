@@ -2,10 +2,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    // Linux ships `ryotunes` as a thin launcher for the native Quickshell client; it never runs the
-    // Tauri app. macOS and Windows still run the bundled Tauri player.
     #[cfg(target_os = "linux")]
     {
+        // Force Tauri on Linux for testing
+        if std::env::var("RYOTUNES_TAURI").is_ok() {
+            app_lib::run();
+            return;
+        }
         native::launch();
     }
     #[cfg(not(target_os = "linux"))]

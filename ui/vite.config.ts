@@ -2,8 +2,14 @@ import tailwindcss from '@tailwindcss/vite';
 import adapter from '@sveltejs/adapter-static';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
+import path from 'path';
 
 export default defineConfig({
+	resolve: {
+		alias: {
+			'$lib': path.resolve('./src/lib')
+		}
+	},
 	server: {
 		port: 5183,
 		strictPort: true

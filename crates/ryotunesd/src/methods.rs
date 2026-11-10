@@ -1509,6 +1509,12 @@ fn set_setting(st: &Arc<AppState>, params: &Value) -> Result<Value, ErrorBody> {
     if key == "lyrics_romanize" {
         st.emit("lyrics-changed", json!({}));
     }
+    if key == "spotify_metadata_only" {
+        let metadata_only = value == "true";
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(st.spotify.set_metadata_only(metadata_only))
+        });
+    }
     null()
 }
 
@@ -2270,6 +2276,9 @@ fn normalize_ui_setting(key: &str, raw: &str) -> Result<String, String> {
                 .ok_or_else(|| "Interface scale must be 80–140% in 10% steps.".into())
         }
         "discord_presence_name" => Ok(raw.to_owned()),
+        "spotify_metadata_only" => matches!(raw, "true" | "false")
+            .then(|| raw.to_owned())
+            .ok_or_else(|| format!("{key} must be true or false.")),
         _ => Err(format!("unknown setting: {key}")),
     }
 }
@@ -2382,6 +2391,19 @@ mod tests {
             Some(r#"ryotunes-collage:["a","b","c","d"]"#.to_string()),
             "four distinct covers form the 2x2 collage; duplicates and extras are ignored"
         );
+    }
+
+    #[test]
+    fn spotify_metadata_only_setting_is_validated() {
+        // Valid values
+        assert_eq!(normalize_ui_setting("spotify_metadata_only", "true").unwrap(), "true");
+        assert_eq!(normalize_ui_setting("spotify_metadata_only", "false").unwrap(), "false");
+        
+        // Invalid values
+        assert!(normalize_ui_setting("spotify_metadata_only", "yes").is_err());
+        assert!(normalize_ui_setting("spotify_metadata_only", "1").is_err());
+        assert!(normalize_ui_setting("spotify_metadata_only", "").is_err());
+        assert!(normalize_ui_setting("spotify_metadata_only", "maybe").is_err());
     }
 }
 

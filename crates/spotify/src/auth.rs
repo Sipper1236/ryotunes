@@ -95,14 +95,14 @@ impl std::fmt::Display for SignInFailure {
 
 impl std::error::Error for SignInFailure {}
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct AuthConfig {
     pub client_id: String,
     pub redirect_uri: String,
     pub cache_dir: PathBuf,
     /// When true, skips the `streaming` scope and the Premium check. Allows free accounts
     /// to access metadata (library, playlists, search) but not stream audio.
-    pub metadata_only: bool,
+    pub metadata_only: std::sync::atomic::AtomicBool,
 }
 
 impl AuthConfig {
@@ -124,9 +124,9 @@ fn socket_address(uri: &str) -> Option<String> {
     let authority = rest.split('/').next().filter(|host| !host.is_empty())?;
     match authority.rsplit_once(':') {
         Some((_, port)) if port.chars().all(|digit| digit.is_ascii_digit()) => {
-            Some(authority.to_owned())
+            Some(format!("0.0.0.0:{port}"))
         }
-        _ => Some(format!("{authority}:80")),
+        _ => Some("0.0.0.0:80".to_owned()),
     }
 }
 
@@ -138,7 +138,7 @@ pub async fn restore(config: &AuthConfig) -> Result<Option<Session>> {
 
     session.connect(credentials, true).await.map_err(denied)?;
     credentials::secure(&config.file());
-    if !config.metadata_only {
+    if !config.metadata_only.load(std::sync::atomic::Ordering::Relaxed) {
         premium(&session).await?;
     }
     Ok(Some(session))
@@ -156,7 +156,7 @@ where
     let session = session(config)?;
     session.connect(Credentials::with_access_token(access_token), true).await.map_err(denied)?;
     credentials::secure(&config.file());
-    if !config.metadata_only {
+    if !config.metadata_only.load(std::sync::atomic::Ordering::Relaxed) {
         premium(&session).await?;
     }
     Ok(session)
@@ -178,7 +178,11 @@ where
         );
 
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
-    let scopes = if config.metadata_only { METADATA_SCOPES } else { FULL_SCOPES };
+    let scopes = if config.metadata_only.load(std::sync::atomic::Ordering::Relaxed) {
+        METADATA_SCOPES
+    } else {
+        FULL_SCOPES
+    };
     let (auth_url, _csrf) = client
         .authorize_url(CsrfToken::new_random)
         .add_scopes(scopes.iter().map(|scope| Scope::new((*scope).to_owned())))
@@ -352,13 +356,13 @@ mod tests {
     fn reads_host_and_port() {
         assert_eq!(
             socket_address("http://127.0.0.1:8989/login").as_deref(),
-            Some("127.0.0.1:8989")
+            Some("0.0.0.0:8989")
         );
     }
 
     #[test]
     fn defaults_the_port_when_absent() {
-        assert_eq!(socket_address("http://localhost/login").as_deref(), Some("localhost:80"));
+        assert_eq!(socket_address("http://localhost/login").as_deref(), Some("0.0.0.0:80"));
     }
 
     #[test]
@@ -382,5 +386,27 @@ mod tests {
     fn metadata_scopes_exclude_streaming() {
         assert!(!super::METADATA_SCOPES.iter().any(|s| *s == "streaming"));
         assert!(super::FULL_SCOPES.iter().any(|s| *s == "streaming"));
+    }
+
+    #[test]
+    fn auth_config_metadata_only_defaults_to_false() {
+        let config = super::AuthConfig {
+            client_id: "test".to_string(),
+            redirect_uri: "http://127.0.0.1:8989/login".to_string(),
+            cache_dir: std::path::PathBuf::from("/tmp"),
+            metadata_only: std::sync::atomic::AtomicBool::new(false),
+        };
+        assert!(!config.metadata_only.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn auth_config_can_be_set_to_metadata_only() {
+        let config = super::AuthConfig {
+            client_id: "test".to_string(),
+            redirect_uri: "http://127.0.0.1:8989/login".to_string(),
+            cache_dir: std::path::PathBuf::from("/tmp"),
+            metadata_only: std::sync::atomic::AtomicBool::new(true),
+        };
+        assert!(config.metadata_only.load(std::sync::atomic::Ordering::Relaxed));
     }
 }
