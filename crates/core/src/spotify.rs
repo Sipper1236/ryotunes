@@ -322,10 +322,9 @@ impl SpotifyState {
             let provider = self.provider.write().clone();
             provider.auth.metadata_only.store(metadata_only, std::sync::atomic::Ordering::Relaxed);
         }
-        // Drop the current client so it gets recreated with the new mode on next use.
-        *self.client.write().await = None;
-        *self.last_recovery.lock() = None;
-        self.refused.store(false, std::sync::atomic::Ordering::Relaxed);
+        // Clear cached credentials so the old session (premium/free) doesn't get restored
+        // with the wrong mode. The new sign-in will write fresh credentials.
+        self.sign_out().await;
     }
 }
 
