@@ -1,4 +1,3 @@
-
 <div align="center">
 
 <img src="docs/assets/ryotunes-hero.svg" alt="Ryotunes — Music, shaped for Ryoku" width="100%" />
@@ -18,7 +17,6 @@
 <br /><br />
 
 **A Ryoku-native desktop music player with native audio playback, live shell theming, and a UI that knows when to disappear.**
-
 [Download](https://github.com/ryoku-dev/ryotunes/releases/latest) · [Architecture](docs/ARCHITECTURE.md) · [Install](docs/INSTALL-ARCH.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Ryoku](https://github.com/ryoku-dev/ryoku-arch)
 
 </div>
@@ -32,7 +30,7 @@
 ### The primary client: Quickshell / QML
 
 **The QML client is the primary Ryotunes application.** It includes the YouTube,
-Spotify and SoundCloud provider selector, downloads, and Settings → About
+Spotify, SoundCloud and Tidal provider selector, downloads, and Settings → About
 software-update controls. The Tauri/WebKitGTK interface is the legacy client,
 not its replacement. Package version numbers alone do not identify the client:
 the release package currently contains both.
@@ -42,7 +40,7 @@ checksum from [the latest release](https://github.com/ryoku-dev/ryotunes/release
 Verify it before changing the installed application:
 
 ```bash
-sha256sum -c ryotunes-1.0.1-1-x86_64.pkg.tar.zst.sha256
+sha256sum -c ryotunes-1.2.3-1-x86_64.pkg.tar.zst.sha256
 ```
 
 Use the filenames for your downloaded release and continue only on `OK`.
@@ -51,13 +49,13 @@ no need to uninstall the primary QML application first:
 
 ```bash
 systemctl --user stop ryotunesd.service ryotunesd.socket
-sudo pacman -U ./ryotunes-1.0.1-1-x86_64.pkg.tar.zst
+sudo pacman -U ./ryotunes-1.2.3-1-x86_64.pkg.tar.zst
 systemctl --user daemon-reload
 systemctl --user enable --now ryotunesd.socket
 ryotunes
 ```
 
-The package's `1:` pacman epoch orders `1:1.0.1-1` above distribution-numbered
+The package's `1:` pacman epoch orders `1:1.2.3-1` above distribution-numbered
 builds such as `2.5.1-1`; it does not mean QML is obsolete. Personal configuration
 and music are preserved. If pacman reports file conflicts, check ownership with
 `pacman -Qo /path/to/file` and back up unowned files before retrying. Do not use
@@ -154,6 +152,7 @@ This requires a Spotify sign-in. The setting persists across restarts.
 - **Picked for you** re-ranks the selected provider's existing Home feed using local listening history, recency and artist variety. With no relevant history, it uses the provider's discovery ordering instead of claiming learned preferences. This adds no recommendation API, paid service or background training: at most 300 candidates are considered for 12 picks, only when the feed or personal data changes. Displaying additional artwork still has a memory cost.
 
 ---
+
 ## Download music in the native client
 
 Click the **download arrow beside the heart** in the player to start saving the current track immediately. The icon shows progress, then a check mark when the file is saved. Clicking an active or completed download opens **Downloads** in the sidebar; failed and cancelled downloads can be retried.
@@ -225,13 +224,12 @@ flowchart LR
     N --> P["native player crate"]
     P --> MPV["libmpv · audio only"]
 
-    N --> I["YouTube · Spotify · SoundCloud · downloads"]
+    N --> I["YouTube · Spotify · SoundCloud · Tidal · downloads"]
     N <-->|"Unix socket RPC + events"| W["Quickshell / QML"]
 
     W --> U["Home · Search · Library"]
     W --> Q["Queue · Lyrics · Now Playing"]
     W --> MINI["Ryotunes Mini"]
-
 ```
 
 More detail: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
@@ -282,23 +280,28 @@ Source/development setup: **[docs/INSTALL-ARCH.md](docs/INSTALL-ARCH.md)**
 <summary><b>Repository map</b></summary>
 
 ```text
+client/                 primary Quickshell / QML interface
 crates/
-  innertube/          YouTube Music request/model layer
-  player/             native playback core
-  listen-protocol/    shared Listen Together protocol
-  sync-server/        optional room relay
-
-client/                primary Quickshell / QML interface
-crates/ryotunesd/       playback daemon, provider RPC and downloads
-src-tauri/             legacy Tauri host
-ui/                    legacy Svelte / WebKitGTK interface
-integrations/          Ryoku / shell integration assets
-packaging/             Arch / Ryoku replacement packaging
-scripts/               diagnostics, release gates and packaging tools
-docs/                  architecture, install, design and troubleshooting
-aur/                   binary AUR recipe sources
+  innertube/            YouTube Music request/model layer
+  player/               native playback core
+  listen-protocol/      shared Listen Together protocol
+  sync-server/          optional room relay
+  core/                 daemon state, resolution pipeline, providers
+  spotify/              Spotify provider (librespot, OAuth, metadata-only)
+  soundcloud/           SoundCloud provider (guest API v2)
+  tidal/                Tidal provider
+  ryotunesd/            playback daemon, provider RPC and downloads
+  ryotunes-cli/         CLI for diagnostics and skin tooling
+src-tauri/              legacy Tauri host
+ui/                     legacy Svelte / WebKitGTK interface
+integrations/           Ryoku / shell integration assets
+packaging/              Arch / Ryoku replacement packaging
+scripts/                diagnostics, release gates and packaging tools
+docs/                   architecture, install, design and troubleshooting
+aur/                    binary AUR recipe sources
+skins/                  skin definitions (paper, ember, mist, matugen template)
+matugen/                matugen template for wallpaper-derived skins
 ```
-
 </details>
 
 <details>
@@ -307,11 +310,13 @@ aur/                   binary AUR recipe sources
 The dependency graphs are locked. Release work is expected to pass both frontend and native gates.
 
 ```bash
-cd ui
+# QML client
+cd client
 pnpm install --frozen-lockfile
 pnpm check
 pnpm build
 
+# Rust workspace
 cd ..
 cargo fmt --all -- --check
 cargo test --workspace --locked
