@@ -37,7 +37,7 @@
 	let deepest = $state(0);
 	afterNavigate((nav) => {
 		if (nav.type === 'enter') depth = deepest = 0;
-		else if (nav.delta !== undefined) depth = Math.max(0, depth + nav.delta);
+		else if (nav.type === 'popstate') depth = Math.max(0, depth + nav.delta);
 		else deepest = depth += 1;
 	});
 

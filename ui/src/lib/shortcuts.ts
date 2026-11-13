@@ -1,6 +1,6 @@
 // One registry, one dispatcher, one command path. The Settings keybind reference renders this exact
 // registry, so a shortcut cannot be documented unless an executable action exists here.
-import { browser } from '$app/environment';
+import { browser } from '$app/env';
 import { goto } from '$app/navigation';
 import * as api from './api';
 import { matchesShortcutChord, type ShortcutChord } from './shortcut-match';

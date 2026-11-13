@@ -8,7 +8,7 @@
 		AlertCircleIcon,
 		InformationCircleIcon
 	} from '@hugeicons/core-free-icons';
-	import { browser } from '$app/environment';
+	import { browser } from '$app/env';
 	import { onMount } from 'svelte';
 	import { beforeNavigate, afterNavigate } from '$app/navigation';
 	import { page } from '$app/state';

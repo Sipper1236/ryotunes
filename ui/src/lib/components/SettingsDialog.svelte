@@ -17,6 +17,8 @@
 	import { t } from '$lib/i18n.svelte';
 
 	type TabId = 'general' | 'playback' | 'providers' | 'data' | 'keybinds' | 'about';
+	const PROVIDERS = ['youtube', 'spotify', 'soundcloud', 'tidal'] as const;
+	type Provider = (typeof PROVIDERS)[number];
 	const TABS: { id: TabId; label: string }[] = [
 		{ id: 'general', label: t('General') },
 		{ id: 'playback', label: t('Playback') },
@@ -341,11 +343,12 @@
 		await api.setSetting('disabled_stream_clients', settings.disabled_stream_clients);
 	}
 
-	async function setProvider(provider: 'youtube' | 'spotify' | 'soundcloud' | 'tidal') {
+	async function setProvider(provider: Provider) {
 		try {
 			await api.setProvider(provider);
 			currentProvider = provider;
-			toast.success(t('Provider switched to {provider}', { provider: provider.charAt(0).toUpperCase() + provider.slice(1) }));
+			const name = provider.charAt(0).toUpperCase() + provider.slice(1);
+			toast.success(t('Provider switched to {provider}').replace('{provider}', name));
 		} catch (e) {
 			toast.error(String(e));
 		}
@@ -670,7 +673,7 @@
 											{t('Choose which music source powers search, browse and playback. Each provider has its own catalogue and features.')}
 										</p>
 										<div class="flex flex-wrap gap-2">
-											{#each ['youtube', 'spotify', 'soundcloud', 'tidal'] as p (p)}
+							{#each PROVIDERS as p (p)}
 												<Button
 													variant={currentProvider === p ? 'default' : 'outline'}
 													size="sm"

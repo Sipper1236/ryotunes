@@ -1,4 +1,6 @@
-import { browser } from '$app/environment';
+import { browser } from '$app/env';
+
+type RouteUrl = Pick<URL, 'pathname' | 'search'>;
 
 const SCROLL_PREFIX = 'ryotunes:v20:scroll:';
 const LAST_ROUTE = 'ryotunes:v20:last-route';
@@ -24,7 +26,7 @@ function safeJson<T>(key: string, fallback: T): T {
 	}
 }
 
-export function routeKey(url: URL | string): string {
+export function routeKey(url: RouteUrl | string): string {
 	if (typeof url === 'string') return url || '/';
 	return `${url.pathname}${url.search}` || '/';
 }
@@ -43,7 +45,7 @@ function writeTrail(trail: string[]): void {
 }
 
 /** Keep an in-app route trail that Escape can peel back safely without ever leaving Ryotunes. */
-export function rememberRoute(url: URL): void {
+export function rememberRoute(url: RouteUrl): void {
 	const current = routeKey(url);
 	let trail = readTrail();
 	const existing = trail.lastIndexOf(current);
@@ -78,11 +80,11 @@ export function lastRoute(): string | null {
 	return safeGet(LAST_ROUTE);
 }
 
-export function saveRouteScroll(url: URL, top: number): void {
+export function saveRouteScroll(url: RouteUrl, top: number): void {
 	safeSet(`${SCROLL_PREFIX}${routeKey(url)}`, String(Math.max(0, Math.round(top))));
 }
 
-export function loadRouteScroll(url: URL): number {
+export function loadRouteScroll(url: RouteUrl): number {
 	const value = Number(safeGet(`${SCROLL_PREFIX}${routeKey(url)}`) ?? '0');
 	return Number.isFinite(value) ? Math.max(0, value) : 0;
 }

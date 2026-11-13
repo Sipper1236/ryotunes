@@ -1,7 +1,7 @@
 // Shared reactive app state (playback + auth), set up ONCE by the root layout. Components import
 // `playback`/`auth` and read them reactively; the Rust side drives them via Tauri events.
 // UI state contract — this module only calls commands / subscribes to events.
-import { browser } from '$app/environment';
+import { browser } from '$app/env';
 import * as api from './api';
 import type {
 	Account,
