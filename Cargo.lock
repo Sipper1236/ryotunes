@@ -4853,6 +4853,8 @@ version = "1.2.3"
 dependencies = [
  "anyhow",
  "bytes",
+ "data-encoding",
+ "hmac",
  "http",
  "libc",
  "librespot-core",
@@ -4865,6 +4867,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha1",
  "tokio",
  "url",
  "uuid 1.25.0",

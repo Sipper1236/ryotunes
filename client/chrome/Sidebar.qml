@@ -27,10 +27,9 @@ Rectangle {
     readonly property string activeTab: (Router.current && Router.current.params && Router.current.params.tab)
         ? Router.current.params.tab : "songs"
 
-    // The user's library playlists (get_library, kind "playlist" — includes the smart On Repeat /
-    // Recently Played cards and device playlists), merged with any pinned playlists from the shared
-    // personal store, deduped by id. Reloaded on (re)connect and after a create.
-    property var libPlaylists: []
+    // The user's library playlists (kind "playlist" — includes smart and device playlists), merged
+    // with pinned playlists from the shared personal store and deduped by id.
+    readonly property var libPlaylists: LibraryCache.items
     readonly property var playlists: {
         var seen = ({}), out = [];
         for (var i = 0; i < root.libPlaylists.length; i++) {
@@ -44,33 +43,18 @@ Rectangle {
         }
         return out;
     }
-    function loadPlaylists() {
-        Daemon.call("get_library")
-            .then((r) => { root.libPlaylists = (r || []).filter((i) => i && i.kind === "playlist"); })
-            .catch(() => { root.libPlaylists = []; });
-    }
     // create_playlist exists in crates/ryotunesd/src/methods.rs (returns the new id); make one and
     // open it so the user can name and fill it. No dialog lives in the rail.
     function newPlaylist() {
         Daemon.call("create_playlist", { title: "New playlist" })
             .then((id) => {
-                root.loadPlaylists();
+                LibraryCache.load(true).catch(() => {});
                 Playback.toast("Playlist created", "success");
                 if (id) Router.push("playlist", { id: id, title: "New playlist" });
             })
             .catch((e) => Playback.toast((e && e.message) ? e.message : "Could not create", "error"));
     }
-    Component.onCompleted: if (Daemon.connected) root.loadPlaylists();
-    Connections {
-        target: Daemon
-        function onSnapshot(snap): void { root.loadPlaylists(); }
-        // A device-playlist mutation (a track added or removed, the cover set or reset) can change a
-        // playlist's auto cover; re-read the rail so its tiles follow.
-        function onEvent(name: string, data: var): void {
-            if (name === "library-changed")
-                root.loadPlaylists();
-        }
-    }
+    Component.onCompleted: LibraryCache.load(false).catch(() => {})
 
     color: "transparent"
     implicitWidth: root.open ? Style.sidebarW : 0

@@ -75,6 +75,10 @@ TestCase {
         compare(P.topArtistIds(p).join(","), "UCb,UCa"); // plays desc, name-keyed dropped
         compare(P.topArtistIds(p, 1).join(","), "UCb");
         compare(P.topArtistIds(P.empty()).length, 0);
+
+        for (var i = 0; i < 6; i++)
+            p.artists["UC" + i] = { name: "Artist " + i, count: 6 - i };
+        compare(P.topArtistIds(p, 5).length, 5);
         // A later note updates the display name even when it started blank.
         P.noteArtist(p, "UCc", "");
         P.noteArtist(p, "UCc", "C");

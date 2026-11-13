@@ -34,6 +34,16 @@ TestCase {
         compare(s.lastError, null);
     }
 
+    function test_playlist_play_prefetch_requires_a_hovered_free_spotify_first_track() {
+        var first = { video_id: "spotify:track:first", title: "First" };
+        var second = { video_id: "spotify:track:second", title: "Second" };
+        compare(PB.freeSpotifyFirstTrack([first, second], true, true), first);
+        compare(PB.freeSpotifyFirstTrack([first], false, true), null);
+        compare(PB.freeSpotifyFirstTrack([first], true, false), null);
+        compare(PB.freeSpotifyFirstTrack([{ video_id: "yt:video" }], true, true), null);
+        compare(PB.freeSpotifyFirstTrack([], true, true), null);
+    }
+
     // queue-index keeps the array already held and patches only the current row.
     function test_queue_index_splices_current_row() {
         var s = freshState();
@@ -79,7 +89,9 @@ TestCase {
     function test_spotify_restore_announcement_signs_the_client_in() {
         var s = freshState();
         s.spotify = { signedIn: false, stored: true, name: null, premium: null };
-        compare(PB.applyEvent(s, "spotify-auth", { state: "restored" }), null);
+        compare(PB.applyEvent(s, "spotify-auth", {
+            state: "restored", premium: true, metadataOnly: false
+        }), null);
         compare(s.spotify.signedIn, true);
         compare(s.spotify.stored, true);
         compare(s.spotify.premium, true);
@@ -88,6 +100,24 @@ TestCase {
         compare(s.spotify.signedIn, false);
         compare(s.spotify.stored, true);
         compare(s.spotify.error, "bad credentials");
+    }
+
+    function test_spotify_metadata_restore_does_not_claim_premium_playback() {
+        var s = { spotify: { signedIn: false, stored: true, name: null } };
+        PB.applyEvent(s, "spotify-auth", {
+            state: "restored", premium: false, metadataOnly: true
+        });
+        compare(s.spotify.signedIn, true);
+        compare(s.spotify.metadataOnly, true);
+        compare(s.spotify.premium, false);
+    }
+
+    function test_spotify_browser_login_waiting_state_is_visible() {
+        var s = { spotify: { signedIn: false, stored: false, error: "" } };
+        var result = PB.applyEvent(s, "spotify-auth", { state: "waiting" });
+        verify(s.spotify.flow === "browser");
+        verify(s.spotify.error.indexOf("Finish signing in") >= 0);
+        verify(result.toast.indexOf("Opened Spotify") >= 0);
     }
 
     // The SoundCloud browser flow drives its own mirror: waiting, sign-in, expiry, sign-out.

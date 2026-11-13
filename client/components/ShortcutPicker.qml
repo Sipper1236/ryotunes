@@ -6,6 +6,8 @@ import Ryoku.Ui.Singletons
 import "../"
 import "../lib/personal.js" as P
 import "../lib/playlist-links.js" as Links
+import "../lib/detail-cache.js" as DetailCache
+import "../lib/search.js" as Search
 
 // The Home "Add shortcut" picker. Instead of sending the user off to search, this raises a modal
 // over Home with three ways to pin a shortcut: the recents/library the user already has, a title
@@ -138,7 +140,7 @@ Item {
         var seq = ++root.librarySeq;
         var provider = Playback.provider;
         root.library = [];
-        Daemon.call("get_library")
+        LibraryCache.load(false)
             .then(function (items) {
                 if (seq !== root.librarySeq || !root.opened || provider !== Playback.provider)
                     return;
@@ -163,7 +165,7 @@ Item {
             return;
         }
         root.searching = true;
-        Daemon.call("search_all", { query: q })
+        Search.loadResults(prov, q, () => Daemon.call("search_all", { query: q }))
             .then(function (res) {
                 if (seq !== root.searchSeq || !root.opened || Playback.provider !== prov)
                     return;
@@ -248,7 +250,7 @@ Item {
             return;
         }
         root.linkLoading = true;
-        Daemon.call("get_playlist", { id: parsed.id })
+        DetailCache.get("get_playlist", { id: parsed.id }, () => Daemon.call("get_playlist", { id: parsed.id }))
             .then(function (p) {
                 if (seq !== root.linkSeq || !root.opened)
                     return;

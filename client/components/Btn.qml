@@ -12,6 +12,7 @@ Item {
     property string text: ""
     property string icon: ""
     property bool primary: false
+    property alias hovered: hover.hovered
     signal clicked()
 
     implicitWidth: row.implicitWidth + Style.sp(4) * 2

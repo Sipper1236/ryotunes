@@ -3,6 +3,7 @@ import QtQuick
 import QtQuick.Layouts
 import Ryoku.Ui.Singletons
 import "../"
+import "../lib/detail-cache.js" as DetailCache
 
 // The library Songs tab, ported from LibrarySongs.svelte: the account's saved songs, which browse
 // like a playlist (FEmusic_liked_videos). One get_playlist + get_playlist_more on the scroll
@@ -11,11 +12,13 @@ import "../"
 Item {
     id: root
 
-    // Signed in to YouTube Music: its liked videos. Otherwise the device's own Liked Songs,
-    // the local playlist the heart writes to (the daemon's LIKED_SONGS_ID).
+    // Use the active provider's account likes. Without a signed-in account provider, show the
+    // device playlist that Ryotunes' heart writes to (the daemon's LIKED_SONGS_ID).
+    readonly property bool spotifyLibrary: Playback.provider === "spotify" && !!(Playback.spotify && Playback.spotify.signedIn)
     readonly property bool youtubeLibrary: !!(Playback.auth && Playback.auth.signedIn)
-    readonly property string songsId: root.youtubeLibrary ? "FEmusic_liked_videos" : "RYOTUNES_LOCAL_PLAYLIST:liked"
-    readonly property string sourceName: root.youtubeLibrary ? "Your songs" : "Liked Songs"
+    readonly property string songsId: root.spotifyLibrary ? "spotify:playlist:liked"
+        : root.youtubeLibrary ? "FEmusic_liked_videos" : "RYOTUNES_LOCAL_PLAYLIST:liked"
+    readonly property string sourceName: root.youtubeLibrary && !root.spotifyLibrary ? "Your songs" : "Liked Songs"
     onSongsIdChanged: root.load()
 
     // The heart changed the device list (or another client did): re-read it in place.
@@ -55,7 +58,8 @@ Item {
     function load() {
         root.loading = true;
         root.errorMsg = "";
-        Daemon.call("get_playlist", { id: root.songsId })
+        DetailCache.get("get_playlist", { id: root.songsId },
+            () => Daemon.call("get_playlist", { id: root.songsId }))
             .then((p) => { root.pl = p; root.loading = false; Qt.callLater(root.scrollTop); })
             .catch((e) => { root.errorMsg = (e && e.message) ? e.message : String(e); root.loading = false; });
     }
@@ -69,7 +73,8 @@ Item {
             return;
         root.loadingMore = true;
         var token = root.pl.continuation;
-        Daemon.call("get_playlist_more", { token: token })
+        DetailCache.get("get_playlist_more", { token: token },
+            () => Daemon.call("get_playlist_more", { token: token }))
             .then((more) => {
                 if (!root.pl || root.pl.continuation !== token)
                     return;

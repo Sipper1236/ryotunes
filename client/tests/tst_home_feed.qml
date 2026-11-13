@@ -1,6 +1,7 @@
 import QtQuick
 import QtTest
 import "../components"
+import "../lib/home.js" as HomeData
 
 TestCase {
     name: "HomeFeed"
@@ -56,5 +57,69 @@ TestCase {
         var offset = feed.contentY;
         wait(50);
         compare(feed.contentY, offset, "The top pin must not reclaim a user-owned scroll position");
+    }
+
+    function test_only_tidal_provider_transitions_replace_home_feed() {
+        verify(!HomeData.providerChangeAffectsHome("youtube", "spotify"));
+        verify(!HomeData.providerChangeAffectsHome("spotify", "soundcloud"));
+        verify(!HomeData.providerChangeAffectsHome("spotify", "spotify"));
+        verify(HomeData.providerChangeAffectsHome("youtube", "tidal"));
+        verify(HomeData.providerChangeAffectsHome("tidal", "spotify"));
+    }
+
+    function test_home_cache_invalidation_tracks_personal_account_events() {
+        verify(HomeData.authEventInvalidatesHome("auth-changed", {}));
+        verify(HomeData.authEventInvalidatesHome("spotify-auth", { state: "signed_in" }));
+        verify(HomeData.authEventInvalidatesHome("spotify-auth", { state: "signed_out" }));
+        verify(HomeData.authEventInvalidatesHome("soundcloud-auth", { state: "signed_in" }));
+        verify(HomeData.authEventInvalidatesHome("soundcloud-auth", { state: "signed_out" }));
+        verify(!HomeData.authEventInvalidatesHome("spotify-auth", { state: "url" }));
+        verify(!HomeData.authEventInvalidatesHome("soundcloud-auth", { state: "waiting" }));
+        verify(!HomeData.authEventInvalidatesHome("spotify-auth", { state: "error" }));
+        verify(!HomeData.authEventInvalidatesHome("provider-changed", {}));
+        verify(!HomeData.authEventInvalidatesHome("now-playing", {}));
+    }
+
+    function test_home_cache_is_shared_across_merged_providers_but_separate_for_tidal() {
+        HomeData.clearFeedCache();
+        var feed = { sections: [{ title: "Cached" }] };
+        HomeData.rememberFeed("youtube", "", feed, 1000);
+        compare(HomeData.cachedFeed("spotify", ""), feed);
+        compare(HomeData.cachedFeed("soundcloud", ""), feed);
+        compare(HomeData.cachedFeed("tidal", ""), null);
+        HomeData.rememberFeed("youtube", "rock", { sections: [{ title: "Rock" }] });
+        compare(HomeData.cachedFeed("youtube", "").sections[0].title, "Cached");
+        compare(HomeData.cachedFeed("youtube", "rock").sections[0].title, "Rock");
+        HomeData.clearFeedCache();
+    }
+
+    function test_fresh_home_cache_skips_revalidation_until_expiry() {
+        HomeData.clearFeedCache();
+        HomeData.rememberFeed("youtube", "", { sections: [] }, 1000);
+        verify(HomeData.feedIsFresh("spotify", "", 60999));
+        verify(!HomeData.feedIsFresh("soundcloud", "", 61000));
+        HomeData.clearFeedCache();
+        verify(!HomeData.feedIsFresh("youtube", "", 1000));
+    }
+
+    function test_persistent_home_snapshot_restores_stale_feed_for_fast_first_paint() {
+        HomeData.clearFeedCache();
+        var feed = { chips: [], sections: [{ title: "Saved Home" }], continuation: "old-token" };
+        var saved = HomeData.persistentSnapshot(feed, 1000);
+        verify(saved.length > 0);
+        verify(HomeData.restorePersistentSnapshot(saved, 72000));
+        compare(HomeData.cachedFeed("spotify", "").sections[0].title, "Saved Home");
+        compare(HomeData.cachedFeed("youtube", "").continuation, null);
+        verify(!HomeData.feedIsFresh("youtube", "", 72000), "stale feed should still trigger refresh");
+        HomeData.clearFeedCache();
+    }
+
+    function test_persistent_home_snapshot_rejects_invalid_and_expired_cache() {
+        HomeData.clearFeedCache();
+        verify(!HomeData.restorePersistentSnapshot("not json", 1000));
+        var saved = HomeData.persistentSnapshot({ sections: [] }, 1000);
+        verify(!HomeData.restorePersistentSnapshot(saved, 86401001));
+        compare(HomeData.cachedFeed("youtube", ""), null);
+        HomeData.clearFeedCache();
     }
 }

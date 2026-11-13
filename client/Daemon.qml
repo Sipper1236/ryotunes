@@ -29,6 +29,9 @@ Singleton {
     property var pending: ({})
     // Whether a subscription has been asked for; drives the re-subscribe on reconnect.
     property bool wantSubscribe: false
+    // Set before emitting the first snapshot so late-created singletons can distinguish a
+    // completed bootstrap from a subscribe request that is still in flight.
+    property bool snapshotReceived: false
     property var sock: null
 
     function reconnect() {
@@ -70,7 +73,10 @@ Singleton {
             return Promise.reject({ code: "disconnected", message: "ryotunesd is not connected" });
         root.call("hello").then(h => { root.protocol = h.protocol; root.daemonVersion = h.daemon; });
         const p = root.call("subscribe", { events: ["*"] });
-        p.then(s => root.snapshot(s));
+        p.then(s => {
+            root.snapshotReceived = true;
+            root.snapshot(s);
+        });
         return p;
     }
 

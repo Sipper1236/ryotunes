@@ -6,6 +6,7 @@ import "../"
 import "../components"
 import "../lib/search.js" as Search
 import "../lib/browse.js" as Browse
+import "../lib/detail-cache.js" as DetailCache
 
 // The search field with a live typeahead, ported from SearchSuggest.svelte. The input feeds a
 // 150 ms-debounced search_all whose result is previewMixed into a small ranked set; Up/Down move the
@@ -21,6 +22,16 @@ Item {
     property int active: -1
     property bool panelOpen: false
     property string loadedFor: ""
+
+    function scheduleActivePrefetch() {
+        prefetchTimer.stop();
+        if (Playback.provider !== "spotify" || !Playback.spotify.metadataOnly)
+            return;
+        var item = root.items[root.active];
+        if (root.panelOpen && item && (item.kind === "song"
+                || DetailCache.metadataDetailMethod(item, Playback.provider, Playback.spotify.metadataOnly)))
+            prefetchTimer.start();
+    }
 
     signal picked()
     signal submitted()
@@ -49,9 +60,10 @@ Item {
         root.loading = true;
         root.panelOpen = true;
         var reqFor = q;
-        Daemon.call("search_all", { query: q })
+        var provider = Playback.provider;
+        Search.loadResults(provider, q, () => Daemon.call("search_all", { query: q }))
             .then((res) => {
-                if (root.value.trim().replace(/\s+/g, " ") !== reqFor)
+                if (root.value.trim().replace(/\s+/g, " ") !== reqFor || Playback.provider !== provider)
                     return;
                 root.items = Search.previewMix(res, 12);
                 root.active = root.items.length ? 0 : -1;
@@ -63,6 +75,7 @@ Item {
 
     Timer { id: debounce; interval: 150; onTriggered: root.runQuery() }
     onValueChanged: {
+        prefetchTimer.stop();
         // A programmatic value (a ?q= arrival that binds `value`) must not pop the dropdown; only a
         // user typing into the focused field does.
         if (!input.activeFocus) { debounce.stop(); return; }
@@ -70,6 +83,28 @@ Item {
         root.loading = true;
         root.panelOpen = true;
         debounce.restart();
+    }
+    onItemsChanged: root.scheduleActivePrefetch()
+    onActiveChanged: root.scheduleActivePrefetch()
+    onPanelOpenChanged: if (!root.panelOpen) prefetchTimer.stop()
+
+    // Suggestions aren't TrackRows; prefetch the stable free Spotify selection before navigation.
+    // Songs warm playback resolution; albums, artists, and playlists warm the page cache.
+    Timer {
+        id: prefetchTimer
+        interval: 300
+        repeat: false
+        onTriggered: {
+            var item = root.items[root.active];
+            if (!root.panelOpen || root.loading || Playback.provider !== "spotify"
+                    || !Playback.spotify.metadataOnly || !item)
+                return;
+            if (item.kind === "song")
+                Playback.prefetchSong(Browse.asSong(item));
+            else
+                DetailCache.prefetchMetadataDetail(item, Playback.provider, Playback.spotify.metadataOnly,
+                    (method, params) => Daemon.call(method, params)).catch(() => {});
+        }
     }
 
     // the field

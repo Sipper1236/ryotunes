@@ -48,7 +48,7 @@ Item {
 
     function load() {
         root.loading = true;
-        Daemon.call("get_library")
+        LibraryCache.load(false)
             .then((p) => {
                 root.playlists = (p || []).filter((i) => i.kind === "playlist"
                     && i.id !== "RYOTUNES_ON_REPEAT" && i.id !== "RYOTUNES_RECENTLY_PLAYED"
@@ -96,6 +96,7 @@ Item {
             .then((id) => {
                 root.showCreate = false;
                 root.createName = "";
+                LibraryCache.load(true).catch(() => {});
                 root.pick({ id: id, title: title });
             })
             .catch((e) => Playback.toast((e && e.message) ? e.message : "Could not create", "error"));

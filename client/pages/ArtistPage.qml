@@ -6,6 +6,7 @@ import Quickshell
 import Ryoku.Ui.Singletons
 import "../"
 import "../components"
+import "../lib/detail-cache.js" as DetailCache
 
 // The artist page, ported from ui/src/routes/artist/[id]/+page.svelte. get_artist(id) once; the page
 // is one TrackList whose header is a PageHero (round artist art, name, counts, Play/Shuffle/Radio/
@@ -108,7 +109,7 @@ Item {
         page.expanded = false;
         page.releaseTab = 0;
         var reqId = page.artistId;
-        Daemon.call("get_artist", { id: page.artistId })
+        DetailCache.get("get_artist", { id: page.artistId }, () => Daemon.call("get_artist", { id: page.artistId }))
             .then((a) => {
                 if (page.artistId !== reqId)
                     return;

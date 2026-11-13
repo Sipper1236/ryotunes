@@ -16,7 +16,7 @@ use librespot_core::{Session, SessionConfig};
 use oauth2::basic::BasicClient;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl, Scope,
-    TokenResponse, TokenUrl,
+    TokenUrl,
 };
 
 use crate::credentials;
@@ -50,8 +50,11 @@ pub const FULL_SCOPES: &[&str] = &[
 pub const METADATA_SCOPES: &[&str] = &[
     "playlist-read-collaborative",
     "playlist-read-private",
+    "playlist-modify-private",
+    "playlist-modify-public",
     "user-follow-read",
     "user-library-read",
+    "user-library-modify",
     "user-read-email",
     "user-read-private",
     "user-read-recently-played",
@@ -124,9 +127,9 @@ fn socket_address(uri: &str) -> Option<String> {
     let authority = rest.split('/').next().filter(|host| !host.is_empty())?;
     match authority.rsplit_once(':') {
         Some((_, port)) if port.chars().all(|digit| digit.is_ascii_digit()) => {
-            Some(format!("0.0.0.0:{port}"))
+            Some(format!("127.0.0.1:{port}"))
         }
-        _ => Some("0.0.0.0:80".to_owned()),
+        _ => Some("127.0.0.1:80".to_owned()),
     }
 }
 
@@ -151,7 +154,7 @@ pub async fn sign_in<F>(config: &AuthConfig, on_url: F) -> Result<Session>
 where
     F: FnOnce(String) + Send + 'static,
 {
-    let access_token = authorize(config, on_url).await?;
+    let access_token = authorize(config, on_url).await?.access_token;
 
     let session = session(config)?;
     session.connect(Credentials::with_access_token(access_token), true).await.map_err(denied)?;
@@ -162,7 +165,7 @@ where
     Ok(session)
 }
 
-async fn authorize<F>(config: &AuthConfig, on_url: F) -> Result<String>
+pub(crate) async fn authorize<F>(config: &AuthConfig, on_url: F) -> Result<crate::WebApiTokens>
 where
     F: FnOnce(String) + Send + 'static,
 {
@@ -204,7 +207,8 @@ where
         .await
         .map_err(|error| anyhow!("Spotify token exchange failed: {error}"))?;
 
-    Ok(token.access_token().secret().to_owned())
+    crate::WebApiTokens::from_oauth(&token)
+        .ok_or_else(|| anyhow!("Spotify did not return refresh credentials for this account"))
 }
 
 /// Wait for a single loopback redirect, mimicking Spotify's own client: bind the redirect socket,
@@ -356,13 +360,13 @@ mod tests {
     fn reads_host_and_port() {
         assert_eq!(
             socket_address("http://127.0.0.1:8989/login").as_deref(),
-            Some("0.0.0.0:8989")
+            Some("127.0.0.1:8989")
         );
     }
 
     #[test]
     fn defaults_the_port_when_absent() {
-        assert_eq!(socket_address("http://localhost/login").as_deref(), Some("0.0.0.0:80"));
+        assert_eq!(socket_address("http://localhost/login").as_deref(), Some("127.0.0.1:80"));
     }
 
     #[test]

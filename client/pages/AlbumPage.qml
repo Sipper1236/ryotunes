@@ -6,6 +6,7 @@ import Ryoku.Ui.Singletons
 import "../"
 import "../components"
 import "../lib/ids.js" as Ids
+import "../lib/detail-cache.js" as DetailCache
 
 // The album page, ported from ui/src/routes/album/[id]/+page.svelte. get_album(id) once; the whole
 // page is one TrackList scroller whose header carries the PageHero (cover, eyebrow, title, meta,
@@ -80,7 +81,7 @@ Item {
         page.query = "";
         page.expanded = false;
         var reqId = page.albumId;
-        Daemon.call("get_album", { id: page.albumId })
+        DetailCache.get("get_album", { id: page.albumId }, () => Daemon.call("get_album", { id: page.albumId }))
             .then((a) => {
                 if (page.albumId !== reqId)
                     return;

@@ -1181,10 +1181,14 @@ Item {
                             }
                             Text {
                                 readonly property var sp: Playback.spotify || ({})
-                                text: sp.signedIn ? "Connected \u00b7 Premium"
+                                text: sp.signedIn ? (page.settings.spotify_metadata_only === "true"
+                                    ? "Connected \u00b7 metadata-only; playback uses YouTube Music"
+                                    : "Connected \u00b7 Premium")
                                     : (sp.error ? sp.error
                                     : (sp.flow === "browser" ? "Waiting for your browser\u2026"
-                                    : "Not connected \u00b7 Premium is required for playback."))
+                                    : (page.settings.spotify_metadata_only === "true"
+                                        ? "Not connected \u00b7 sign in to browse Spotify"
+                                        : "Not connected \u00b7 Premium is required for playback.")))
                                 color: sp.error ? Style.accent : Tokens.inkMuted; font.family: Style.fontUi; font.pixelSize: Style.fs.sm
                                 wrapMode: Text.WordWrap; Layout.fillWidth: true
                             }

@@ -6,6 +6,9 @@ import Ryoku.Ui.Singletons
 import "../"
 import "../components"
 import "../lib/ids.js" as Ids
+import "../lib/liked-cache.js" as LikedCache
+import "../lib/detail-cache.js" as DetailCache
+import "../lib/playback.js" as PB
 
 // The playlist page, ported from ui/src/routes/playlist/[id]/+page.svelte. get_playlist(id) once,
 // then get_playlist_more on the scroll sentinel — a five-figure Liked Songs list stays a single
@@ -33,6 +36,7 @@ Item {
     property bool editing: false
 
     readonly property bool isLiked: page.playlistId === "VLLM"
+    readonly property bool isSpotifyLiked: page.playlistId === "spotify:playlist:liked"
     readonly property bool isSmart: Ids.isSmartPlaylistId(page.playlistId)
     readonly property bool isLocal: String(page.playlistId).indexOf("RYOTUNES_LOCAL_PLAYLIST:") === 0
     readonly property bool owned: !!(page.pl && page.pl.owned) && !page.isLiked
@@ -58,6 +62,32 @@ Item {
 
     onParamsChanged: page.load()
     Component.onCompleted: page.load()
+
+    function schedulePlayPrefetch() {
+        playPrefetchTimer.stop();
+        if (!page.loading && page.pl && PB.freeSpotifyFirstTrack(
+                page.pl.items, !!(Playback.spotify && Playback.spotify.metadataOnly), hero.primaryHovered))
+            playPrefetchTimer.start();
+    }
+    onPlChanged: page.schedulePlayPrefetch()
+    onLoadingChanged: page.schedulePlayPrefetch()
+
+    Connections {
+        target: hero
+        function onPrimaryHoveredChanged(): void { page.schedulePlayPrefetch(); }
+    }
+
+    Timer {
+        id: playPrefetchTimer
+        interval: 300
+        repeat: false
+        onTriggered: {
+            var first = PB.freeSpotifyFirstTrack(page.pl ? page.pl.items : [],
+                !!(Playback.spotify && Playback.spotify.metadataOnly), hero.primaryHovered);
+            if (first)
+                Playback.prefetchSong(first);
+        }
+    }
 
     // 80 ms filter debounce (clearing is instant).
     Timer { id: filterTimer; interval: 80; onTriggered: page.applied = page.query }
@@ -115,7 +145,17 @@ Item {
         page.confirmingDelete = false;
         page.editing = false;
         var reqId = page.playlistId;
-        Daemon.call("get_playlist", { id: page.playlistId })
+        var cachedKey = LikedCache.firstPageKey("default", false);
+        var cached = page.isSpotifyLiked ? LikedCache.get(cachedKey) : null;
+        if (cached !== null) {
+            page.pl = cached;
+            page.loading = false;
+            Qt.callLater(page.scrollTop);
+            return;
+        }
+        (page.isSpotifyLiked
+            ? LikedCache.loadFirstPage(() => Daemon.call("get_playlist", { id: page.playlistId }))
+            : DetailCache.get("get_playlist", { id: page.playlistId }, () => Daemon.call("get_playlist", { id: page.playlistId })))
             .then((p) => {
                 if (page.playlistId !== reqId)
                     return;
@@ -142,7 +182,7 @@ Item {
         if (!page.playlistId)
             return;
         var reqId = page.playlistId;
-        Daemon.call("get_playlist", { id: page.playlistId })
+        DetailCache.get("get_playlist", { id: page.playlistId }, () => Daemon.call("get_playlist", { id: page.playlistId }))
             .then((p) => {
                 if (!page.pl || page.playlistId !== reqId)
                     return;
@@ -166,10 +206,17 @@ Item {
             return;
         page.loadingMore = true;
         var token = page.pl.continuation;
-        Daemon.call("get_playlist_more", { token: token })
+        var cached = page.isSpotifyLiked ? LikedCache.get(token) : null;
+        (cached !== null ? Promise.resolve(cached)
+            : page.isSpotifyLiked
+                ? Daemon.call("get_playlist_more", { token: token })
+                : DetailCache.get("get_playlist_more", { token: token },
+                    () => Daemon.call("get_playlist_more", { token: token })))
             .then((more) => {
                 if (!page.pl || page.pl.continuation !== token)
                     return;
+                if (page.isSpotifyLiked)
+                    LikedCache.put(token, more);
                 page.pl = Object.assign({}, page.pl, {
                     items: page.pl.items.concat(more.items),
                     continuation: more.items.length ? more.continuation : undefined

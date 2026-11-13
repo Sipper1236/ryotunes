@@ -134,15 +134,18 @@ The QML window can close while the daemon continues playback or active downloads
 
 ### Spotify free account support (metadata-only mode)
 
-Ryotunes now supports Spotify **free (non-Premium) accounts** via a metadata-only mode with YouTube Music fallback:
+Ryotunes supports Spotify **free (non-Premium) listener accounts** through a metadata-only mode with YouTube Music fallback:
 
-- **Settings → Providers** → select **Spotify** → enable **"Spotify metadata-only mode (free accounts)"**
-- OAuth uses metadata scopes only (no `streaming` scope) — works with free accounts
-- Browse/search: full Spotify catalogue (search, library, playlists, artist/album pages)
+- **Settings → Providers** → enable **Spotify free account (metadata only)**, then sign in under **Settings → Account**
+- Sign-in opens your default browser and imports Spotify's `sp_dc` session cookie for the Pathfinder metadata API; no developer app is needed for metadata-only mode
+- Browse/search: Spotify search, saved tracks/albums, playlists, artist and album pages
 - Playback: each Spotify track resolves via YouTube Music automatically (duration-verified match)
 - Premium users: keep metadata-only **off** for direct Spotify streaming via librespot
 
-This requires a Spotify sign-in. The setting persists across restarts.
+Metadata mode requires a Spotify web sign-in. The internal endpoints may change without notice;
+see [`docs/FREE-SPOTIFY.md`](docs/FREE-SPOTIFY.md) for current feature coverage and limitations.
+The setting persists across restarts. Spotify's personalized Home feed and lyrics are unavailable
+in metadata mode.
 
 ### Home in the primary QML client
 

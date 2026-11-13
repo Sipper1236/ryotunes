@@ -27,13 +27,18 @@ mod provider;
 mod radio;
 mod search;
 mod stream;
+mod web_api;
 mod wire;
 
-pub use auth::{SignInFailure, SignInProblem, FULL_SCOPES, METADATA_SCOPES, DEFAULT_CLIENT_ID, DEFAULT_REDIRECT_URI};
+pub use auth::{
+    DEFAULT_CLIENT_ID, DEFAULT_REDIRECT_URI, FULL_SCOPES, METADATA_SCOPES, SignInFailure,
+    SignInProblem,
+};
 pub use client::{Client, SearchResults};
 pub use models::*;
 pub use provider::{SpotifyConfig, SpotifyProvider};
 pub use stream::{StreamEvent, StreamHandle};
+pub(crate) use web_api::{Tokens as WebApiTokens, WebApiClient};
 
 /// The media kinds [`Client::share_url`] can address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

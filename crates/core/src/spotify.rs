@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
-use ryotunes_spotify::{Client, SpotifyProvider, SpotifyConfig, DEFAULT_CLIENT_ID, DEFAULT_REDIRECT_URI};
+use ryotunes_spotify::{
+    Client, SpotifyConfig, SpotifyProvider, DEFAULT_CLIENT_ID, DEFAULT_REDIRECT_URI,
+};
 use tokio::sync::RwLock;
 
 /// Which catalogue the browsing commands (search, home, library, album, artist, playlist) read
@@ -46,6 +48,22 @@ impl Provider {
 }
 
 pub const SPOTIFY_TRACK_PREFIX: &str = "spotify:track:";
+pub const SPOTIFY_PLAYLIST_TOKEN_PREFIX: &str = "ryotunes:spotify-playlist:v1";
+
+/// Build the opaque continuation token for a Spotify metadata-only playlist.
+pub fn spotify_playlist_continuation(playlist_id: &str, page: u32) -> String {
+    format!("{SPOTIFY_PLAYLIST_TOKEN_PREFIX}:{page}:{playlist_id}")
+}
+
+/// Decode a Spotify playlist continuation token and reject malformed playlist ids.
+pub fn parse_spotify_playlist_continuation(token: &str) -> Option<(&str, u32)> {
+    let rest = token.strip_prefix(SPOTIFY_PLAYLIST_TOKEN_PREFIX)?.strip_prefix(':')?;
+    let (page, playlist_id) = rest.split_once(':')?;
+    if playlist_id.is_empty() || !playlist_id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some((playlist_id, page.parse().ok()?))
+}
 
 /// True for any id the daemon minted for a Spotify item (`spotify:<kind>:<base62>`).
 pub fn is_spotify_id(id: &str) -> bool {
@@ -55,6 +73,23 @@ pub fn is_spotify_id(id: &str) -> bool {
 /// The bare base62 id of a Spotify track id, or None for anything else.
 pub fn spotify_track_id(id: &str) -> Option<&str> {
     id.strip_prefix(SPOTIFY_TRACK_PREFIX).filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod playlist_page_tests {
+    use super::{parse_spotify_playlist_continuation, spotify_playlist_continuation};
+
+    #[test]
+    fn playlist_page_tokens_round_trip_and_reject_invalid_ids() {
+        let token = spotify_playlist_continuation("6X1x82kppWZmDzlXXK3y9s", 3);
+        assert_eq!(
+            parse_spotify_playlist_continuation(&token),
+            Some(("6X1x82kppWZmDzlXXK3y9s", 3))
+        );
+        assert!(parse_spotify_playlist_continuation("ryotunes:spotify-playlist:v1:nope:bad:id")
+            .is_none());
+        assert!(parse_spotify_playlist_continuation("ryotunes:spotify-playlist:v1:1:").is_none());
+    }
 }
 
 pub const SC_TRACK_PREFIX: &str = "sc:track:";
@@ -145,7 +180,10 @@ pub struct SpotifyState {
 impl SpotifyState {
     pub fn new(data_dir: PathBuf, selected: Provider, metadata_only: bool) -> Self {
         let config = SpotifyConfig {
-            client_id: DEFAULT_CLIENT_ID.to_owned(),
+            client_id: std::env::var("RYOTUNES_SPOTIFY_CLIENT_ID")
+                .ok()
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_owned()),
             redirect_uri: DEFAULT_REDIRECT_URI.to_owned(),
             metadata_only,
         };
@@ -200,6 +238,12 @@ impl SpotifyState {
     /// Whether a usable client exists.
     pub async fn status(&self) -> bool {
         self.client().await.is_some()
+    }
+
+    /// Check the current session without starting or waiting on credential restore. Opening
+    /// snapshots use this because startup restore is announced separately via `spotify-auth`.
+    pub async fn cached_status(&self) -> bool {
+        self.live_client().await.is_some()
     }
 
     /// The signed-in client, cloned out for use without holding the lock.
@@ -300,6 +344,16 @@ impl SpotifyState {
         Ok(())
     }
 
+    /// Sign in to metadata mode with a Spotify web session cookie, without a librespot session.
+    pub async fn sign_in_web_session(&self, session_cookie: String) -> Result<()> {
+        let provider = self.provider.read().clone();
+        let client = provider.sign_in_web_session(session_cookie).await?;
+        *self.client.write().await = Some(Arc::new(client));
+        *self.last_recovery.lock() = None;
+        self.refused.store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Forget the cached credentials and drop the current client.
     pub async fn sign_out(&self) {
         let provider = self.provider.read().clone();
@@ -390,11 +444,11 @@ mod tests {
     async fn set_metadata_only_updates_flag_and_clears_client() {
         let dir = tempfile::tempdir().unwrap();
         let state = SpotifyState::new(dir.path().to_path_buf(), Provider::Spotify, false);
-        
+
         assert!(!state.is_metadata_only());
-        
+
         state.set_metadata_only(true).await;
-        
+
         assert!(state.is_metadata_only());
         // Client should be cleared so it gets recreated with new mode
         assert!(state.client().await.is_none());
@@ -404,11 +458,11 @@ mod tests {
     async fn set_metadata_only_to_false_updates_flag() {
         let dir = tempfile::tempdir().unwrap();
         let state = SpotifyState::new(dir.path().to_path_buf(), Provider::Spotify, true);
-        
+
         assert!(state.is_metadata_only());
-        
+
         state.set_metadata_only(false).await;
-        
+
         assert!(!state.is_metadata_only());
     }
 }

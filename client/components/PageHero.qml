@@ -19,6 +19,7 @@ Item {
     property string placeholderIcon: "music"
     property string primaryLabel: "Play"
     property bool primaryPlaying: false
+    property alias primaryHovered: primaryButton.hovered
     property bool likeable: false
     property bool liked: false
     property bool showMore: true
@@ -83,6 +84,7 @@ Item {
                 Layout.topMargin: Style.sp(2)
                 spacing: Style.sp(2)
                 Btn {
+                    id: primaryButton
                     primary: true
                     icon: root.primaryPlaying ? "pause" : "play"
                     text: root.primaryPlaying ? "Pause" : root.primaryLabel

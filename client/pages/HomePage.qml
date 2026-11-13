@@ -7,6 +7,8 @@ import "../"
 import "../components"
 import "../chrome"
 import "../lib/browse.js" as Browse
+import "../lib/detail-cache.js" as DetailCache
+import "../lib/home.js" as HomeData
 import "../lib/ids.js" as Ids
 import "../lib/recommendations.js" as Recommendations
 
@@ -49,18 +51,54 @@ Item {
         && !(Playback.tidal && Playback.tidal.signedIn)
     readonly property var forgottenList: page.forgottenSongs()
 
-    // Familiar artists: the most-played artists (topArtistIds) resolved to round cards. Loaded once.
-    property var famIds: Personal.topArtistIds(6)
+    // The shelf displays at most five artists; resolve only those pages.
+    property var famIds: Personal.topArtistIds(5)
     property var famArtists: []
+    property Item familiarShelfItem: null
     property bool famLoaded: false
-    onFamIdsChanged: page.loadFamiliar()
+    property string homeProvider: "youtube"
+    property bool providerSnapshotSeen: false
+    onFamIdsChanged: page.maybeLoadFamiliar()
 
-    Component.onCompleted: { page.load(""); page.loadFamiliar(); }
+    Component.onCompleted: {
+        page.homeProvider = Playback.provider;
+        HomeStore.restore();
+        page.load("");
+    }
 
-    // A provider switch swaps the whole catalogue: reload the feed (or fall to the sign-in card).
+    // Only TIDAL replaces the merged Home feed; the other selected providers share it.
     Connections {
-        target: Playback
-        function onProviderChanged(): void { page.load(page.selected); }
+        target: Daemon
+        function onSnapshot(snap): void {
+            if (!snap || !snap.provider)
+                return;
+            var previous = page.homeProvider;
+            page.homeProvider = snap.provider;
+            if (!page.providerSnapshotSeen) {
+                page.providerSnapshotSeen = true;
+                // The first request already uses the daemon's selected provider. Retry here only
+                // if it failed before the socket connected and the page has no result yet.
+                if (!page.home && !page.loading)
+                    page.load(page.selected);
+                return;
+            }
+            if (HomeData.providerChangeAffectsHome(previous, snap.provider))
+                page.load(page.selected);
+        }
+        function onEvent(name: string, data: var): void {
+            if (HomeData.authEventInvalidatesHome(name, data)) {
+                HomeData.clearFeedCache();
+                HomeStore.clear();
+                if (page.homeProvider !== "tidal")
+                    page.load(page.selected);
+            }
+            if (name !== "provider-changed" || !data || !data.provider)
+                return;
+            var previous = page.homeProvider;
+            page.homeProvider = data.provider;
+            if (HomeData.providerChangeAffectsHome(previous, data.provider))
+                page.load(page.selected);
+        }
     }
 
     Connections {
@@ -107,6 +145,15 @@ Item {
         page.refreshRecommendations();
     }
 
+    function showHome(h) {
+        blocks.clear();
+        page.forgotten = null;
+        page.listenAgain = null;
+        page.home = h;
+        page.chips = (h.chips || []).filter((c) => c.title !== "Podcasts");
+        page.appendSections(h.sections || []);
+    }
+
     function forgottenSongs() {
         if (!page.forgotten)
             return [];
@@ -117,37 +164,66 @@ Item {
         if (page.famLoaded || page.famIds.length < 3)
             return;
         page.famLoaded = true;
-        Promise.all(page.famIds.map((id) => Daemon.call("get_artist", { id: id }).catch(() => null)))
+        Promise.all(page.famIds.map((id) => DetailCache.get("get_artist", { id: id },
+            () => Daemon.call("get_artist", { id: id })).catch(() => null)))
             .then((pages) => { page.famArtists = pages.filter((p) => !!p); });
+    }
+
+    // Artist pages are a secondary Home shelf. Fetch them when the shelf is visible or within
+    // roughly one viewport of it, after the main feed request has finished.
+    function maybeLoadFamiliar() {
+        if (page.famLoaded || page.loading || page.famIds.length < 3 || page.selected !== "")
+            return;
+        Qt.callLater(() => {
+            if (page.famLoaded || page.loading || page.selected !== "" || !page.familiarShelfItem
+                    || !page.familiarShelfItem.visible || list.height <= 0)
+                return;
+            var shelfY = page.familiarShelfItem.mapToItem(list.contentItem, 0, 0).y;
+            if (shelfY <= list.contentY + list.height * 1.25)
+                page.loadFamiliar();
+        });
     }
 
     function load(params) {
         page.selected = params;
         var request = ++page.requestId;
+        var cacheProvider = Playback.provider;
+        var cached = HomeData.cachedFeed(cacheProvider, params);
         page.loadingMore = false;
         list.cancelFlick();
         list.stickTop = true;
         page.moreError = false;
-        blocks.clear();
-        page.forgotten = null;
-        page.listenAgain = null;
-        page.loading = true;
         page.errorMsg = "";
+        if (cached) {
+            page.showHome(cached);
+            page.loading = false;
+            if (HomeData.feedIsFresh(cacheProvider, params)) {
+                page.maybeLoadFamiliar();
+                return;
+            }
+        } else {
+            blocks.clear();
+            page.forgotten = null;
+            page.listenAgain = null;
+            page.loading = true;
+        }
         Daemon.call("get_home", { params: params ? params : null })
             .then((h) => {
                 if (page.requestId !== request)
                     return;
-                page.home = h;
-                if (h.chips && h.chips.length)
-                    page.chips = h.chips.filter((c) => c.title !== "Podcasts");
-                page.appendSections(h.sections || []);
+                HomeData.rememberFeed(cacheProvider, params, h);
+                if (cacheProvider !== "tidal" && !params)
+                    HomeStore.save(h);
+                page.showHome(h);
                 page.loading = false;
+                page.maybeLoadFamiliar();
             })
             .catch((e) => {
                 if (page.requestId !== request)
                     return;
                 page.errorMsg = (e && e.message) ? e.message : String(e);
                 page.loading = false;
+                page.maybeLoadFamiliar();
             });
     }
 
@@ -198,8 +274,8 @@ Item {
         spacing: Style.sp(10)
 
         // HomeFeed releases its top pin without restoring a stale pre-layout offset.
-        onContentYChanged: page.maybeLoadMore()
-        onContentHeightChanged: page.maybeLoadMore()
+        onContentYChanged: { page.maybeLoadMore(); page.maybeLoadFamiliar(); }
+        onContentHeightChanged: { page.maybeLoadMore(); page.maybeLoadFamiliar(); }
 
         delegate: Item {
             required property var sectionData
@@ -394,6 +470,8 @@ Item {
                 }
 
                 HomePersonal {
+                    id: familiarShelf
+                    Component.onCompleted: page.familiarShelfItem = familiarShelf
                     Layout.fillWidth: true
                     visible: page.selected === ""
                     recents: page.recents

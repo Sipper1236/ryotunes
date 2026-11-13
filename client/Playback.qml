@@ -2,6 +2,7 @@ pragma Singleton
 import QtQuick
 import Quickshell
 import "lib/playback.js" as PB
+import "lib/ids.js" as Ids
 
 // The client's only playback state: a mirror of the daemon, never a source of truth. Every event
 // from Daemon is applied by lib/playback.js applyEvent (ported from player.svelte.ts); every method
@@ -35,9 +36,9 @@ Singleton {
     // reads it; each catalogue's own sign-in state gates its shelves, not the selector.
     property string provider: "youtube"
     // The Spotify account, mirrored from the daemon (the subscribe snapshot's `spotify` object and
-    // the `spotify-auth` events). `signedIn` gates the Spotify catalogue; `premium` is null until the
-    // profile is known. Never a source of truth — every field lands from the daemon.
-    property var spotify: ({ signedIn: false, stored: false, name: null, premium: null })
+    // the `spotify-auth` events). `signedIn` gates the Spotify catalogue; metadataOnly identifies
+    // Web API sessions that play through YouTube. Never a source of truth.
+    property var spotify: ({ signedIn: false, stored: false, name: null, premium: null, metadataOnly: false })
     // The SoundCloud account, mirrored the same way (the snapshot's `soundcloud` object and the
     // `soundcloud-auth` events). SoundCloud browses and plays as a guest; signing in only adds
     // the account's own shelves (playlists, likes, following) to Home.
@@ -56,6 +57,10 @@ Singleton {
     // (or reopening the stage) never refetches. Only SoundCloud ids ("sc:") carry a waveform.
     property var waveform: null
     property var waveformCache: ({})
+    // Recently asked stream prefetches, shared by reused TrackRow delegates. The daemon keeps the
+    // resolved URL in its normal latency cache; this short UI throttle prevents scrolling back
+    // over the same rows from launching duplicate speculative resolves.
+    property var prefetchTimes: ({})
 
     // --- optimistic drag state ---------------------------------------------------------------
     // NaN when the seek thumb is not held; a number pins the shown position and suppresses the
@@ -110,7 +115,8 @@ Singleton {
         if (snap.provider) root.provider = snap.provider;
         if (snap.spotify)
             root.spotify = { signedIn: !!snap.spotify.signedIn, stored: !!snap.spotify.stored,
-                name: snap.spotify.name, premium: snap.spotify.premium };
+                name: snap.spotify.name, premium: snap.spotify.premium,
+                metadataOnly: !!snap.spotify.metadataOnly };
         if (snap.tidal)
             root.tidal = { signedIn: !!snap.tidal.signedIn, name: snap.tidal.name,
                 quality: snap.tidal.quality, hasCredentials: !!snap.tidal.hasCredentials,
@@ -147,6 +153,26 @@ Singleton {
 
     // --- methods (each a daemon call) --------------------------------------------------------
     function play(item) { return Daemon.call("play", { item: item }); }
+    function prefetchSong(song) {
+        if (!Daemon.connected || !song || !song.video_id)
+            return;
+        var id = String(song.video_id);
+        var provider = Ids.providerOf(id);
+        if (provider !== "youtube" && !(provider === "spotify" && root.spotify.metadataOnly))
+            return;
+        var now = Date.now();
+        if (root.prefetchTimes[id] && now - root.prefetchTimes[id] < 30000)
+            return;
+        var next = Object.assign({}, root.prefetchTimes);
+        next[id] = now;
+        var keys = Object.keys(next);
+        if (keys.length > 48) {
+            keys.sort((a, b) => next[a] - next[b]);
+            delete next[keys[0]];
+        }
+        root.prefetchTimes = next;
+        Daemon.call("prefetch_stream", { item: song }).catch(() => {});
+    }
     function playIndex(i) { return Daemon.call("play_index", { index: i }); }
     function togglePause() { return Daemon.call("toggle_pause"); }
     function next() { return Daemon.call("next_track"); }
@@ -163,8 +189,8 @@ Singleton {
         root.provider = p;
         return Daemon.call("set_provider", { provider: p }).catch(() => {});
     }
-    // Start the Spotify OAuth flow; the daemon spawns the task and drives the rest through
-    // spotify-auth events (the url step opens the browser). Idempotent while a flow is running.
+    // Start Spotify sign-in; the daemon handles Premium OAuth or watches for the metadata-only
+    // browser cookie, then reports progress through spotify-auth events. Idempotent while running.
     function spotifySignIn() { return Daemon.call("spotify_sign_in"); }
     function spotifySignOut() { return Daemon.call("spotify_sign_out"); }
     function tidalSignIn() { return Daemon.call("tidal_sign_in"); }

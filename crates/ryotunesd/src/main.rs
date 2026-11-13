@@ -75,7 +75,14 @@ fn main() -> anyhow::Result<()> {
                 match state.spotify.restore().await {
                     Ok(true) => {
                         tracing::info!("spotify: restored a cached session");
-                        state.emit("spotify-auth", serde_json::json!({ "state": "restored" }));
+                        state.emit(
+                            "spotify-auth",
+                            serde_json::json!({
+                                "state": "restored",
+                                "metadataOnly": state.spotify.is_metadata_only(),
+                                "premium": !state.spotify.is_metadata_only(),
+                            }),
+                        );
                     }
                     Ok(false) => tracing::debug!("spotify: no cached session to restore"),
                     Err(e) => {

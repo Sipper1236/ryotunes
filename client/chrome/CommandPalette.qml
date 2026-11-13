@@ -6,6 +6,7 @@ import "../"
 import "../components"
 import "../lib/search.js" as Search
 import "../lib/browse.js" as Browse
+import "../lib/detail-cache.js" as DetailCache
 
 // The Ctrl+K command palette, ported from CommandPalette.svelte. A modal typeahead over the same
 // search_all → previewMix rows the field shows; Up/Down move, Enter takes the row (or, at the tail,
@@ -25,7 +26,18 @@ Item {
     property bool loading: false
     property int active: 0
 
+    function scheduleActivePrefetch() {
+        prefetchTimer.stop();
+        if (Playback.provider !== "spotify" || !Playback.spotify.metadataOnly)
+            return;
+        var item = root.items[root.active];
+        if (root.open && item && (item.kind === "song"
+                || DetailCache.metadataDetailMethod(item, Playback.provider, Playback.spotify.metadataOnly)))
+            prefetchTimer.start();
+    }
+
     onOpenChanged: {
+        prefetchTimer.stop();
         if (root.open) {
             root.query = "";
             root.items = [];
@@ -33,6 +45,8 @@ Item {
             input.forceActiveFocus();
         }
     }
+    onItemsChanged: root.scheduleActivePrefetch()
+    onActiveChanged: root.scheduleActivePrefetch()
 
     // "All results" sits at the tail when the query is long enough.
     readonly property bool hasAll: root.query.trim().length >= 2
@@ -65,9 +79,10 @@ Item {
         }
         root.loading = true;
         var reqFor = q;
-        Daemon.call("search_all", { query: q })
+        var provider = Playback.provider;
+        Search.loadResults(provider, q, () => Daemon.call("search_all", { query: q }))
             .then((res) => {
-                if (root.query.trim().replace(/\s+/g, " ") !== reqFor)
+                if (root.query.trim().replace(/\s+/g, " ") !== reqFor || Playback.provider !== provider)
                     return;
                 root.items = Search.previewMix(res, 12);
                 root.active = 0;
@@ -77,7 +92,26 @@ Item {
     }
 
     Timer { id: debounce; interval: 150; onTriggered: root.runQuery() }
+    // Palette rows aren't TrackRows; prefetch a stable selection so navigation can reuse the
+    // Spotify Free result or page details rather than starting network work after the click.
+    Timer {
+        id: prefetchTimer
+        interval: 300
+        repeat: false
+        onTriggered: {
+            var item = root.items[root.active];
+            if (!root.open || root.loading || Playback.provider !== "spotify"
+                    || !Playback.spotify.metadataOnly || !item)
+                return;
+            if (item.kind === "song")
+                Playback.prefetchSong(Browse.asSong(item));
+            else
+                DetailCache.prefetchMetadataDetail(item, Playback.provider, Playback.spotify.metadataOnly,
+                    (method, params) => Daemon.call(method, params)).catch(() => {});
+        }
+    }
     onQueryChanged: {
+        prefetchTimer.stop();
         if (root.query.trim().length < 2) { debounce.stop(); root.items = []; return; }
         root.loading = true;
         debounce.restart();

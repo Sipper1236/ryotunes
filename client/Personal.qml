@@ -75,7 +75,9 @@ Singleton {
     Component.onCompleted: {
         root.wasSignedIn = !!(Playback.auth && Playback.auth.signedIn);
         root.wasSpotifyIn = !!(Playback.spotify && Playback.spotify.signedIn);
-        if (Daemon.connected) root.reload();
+        // If the opening subscribe is still in flight, onSnapshot will load the store. If this
+        // singleton is created later, after that snapshot, fetch its current state here.
+        if (Daemon.connected && Daemon.snapshotReceived) root.reload();
     }
 
     function reload() {

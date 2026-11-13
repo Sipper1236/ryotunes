@@ -19,9 +19,33 @@ function asSong(i) {
         duration: i.duration,
         play_count: i.playCount,
         thumbnail: i.thumbnail,
+        album: i.album,
+        album_id: i.albumId,
         explicit: i.explicit,
-        is_upload: i.isUpload
+        is_upload: i.isUpload,
+        is_video: !!i.isVideo
     };
+}
+
+// Spotify, SoundCloud, and TIDAL return a complete set of category slices in search_all. Reusing
+// those avoids repeating the same provider search for songs or when a category is expanded.
+function hasCompleteMixedSearch(provider) {
+    return provider === "spotify" || provider === "soundcloud" || provider === "tidal";
+}
+
+function searchSongRows(pageItems, mixedItems) {
+    var source = pageItems && pageItems.length
+        ? pageItems
+        : (mixedItems || []).map(asSong);
+    return source.filter(song => !song.is_video);
+}
+
+function expandedMixedSearchRows(results, category, pageItems) {
+    if (!results)
+        return [];
+    if (category === "songs")
+        return searchSongRows(pageItems, results.songs);
+    return results[category] || [];
 }
 
 // The four-per-column song layout a "mostly songs" shelf uses: split an ordered song list into

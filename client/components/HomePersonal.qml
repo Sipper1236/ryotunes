@@ -5,6 +5,7 @@ import Ryoku.Ui.Singletons
 import "../"
 import "../lib/browse.js" as Browse
 import "../lib/ids.js" as Ids
+import "../lib/detail-cache.js" as DetailCache
 
 // Home's personal blocks, the ones the original Ryotunes built its Home around: "Jump back in" as a
 // two-column grid of what you opened last (art 48, title, meta, play on hover); "Familiar artists"
@@ -44,7 +45,8 @@ ColumnLayout {
         }
         if (it.kind !== "album" && it.kind !== "playlist")
             return;
-        Daemon.call(it.kind === "album" ? "get_album" : "get_playlist", { id: it.id })
+        var method = it.kind === "album" ? "get_album" : "get_playlist";
+        DetailCache.get(method, { id: it.id }, () => Daemon.call(method, { id: it.id }))
             .then((media) => Daemon.call("play_playlist", {
                 items: media.items,
                 sourceId: it.kind === "album" ? media.playlistId

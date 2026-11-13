@@ -461,7 +461,9 @@ Item {
                         Layout.fillWidth: true
                     }
                     Text {
-                        text: (Playback.spotify && Playback.spotify.signedIn) ? "Spotify" : "Premium required"
+                        text: (Playback.spotify && Playback.spotify.signedIn)
+                            ? (Playback.spotify.metadataOnly ? "Metadata only" : "Spotify")
+                            : (Playback.settings.spotify_metadata_only === "true" ? "Sign in to browse" : "Premium required")
                         color: Tokens.inkMuted
                         font.family: Style.fontUi
                         font.pixelSize: Style.fs.sm

@@ -1,17 +1,12 @@
-//! SoundCloud sign-in through the browser the user already uses, instead of a Ryotunes-owned
-//! webview. The embedded WebKit window could not complete real sign-ins: hCaptcha challenges
-//! and the Google/Facebook/Apple popup flows need a genuine browser (their own engine, their
-//! own profile, working popups), and users rightly refuse to type passwords into an app-owned
-//! window. So `soundcloud_sign_in` now opens soundcloud.com in the system default browser and
-//! imports the session from that browser's own cookie store once the user has signed in there.
+//! Web sign-in through the browser the user already uses, instead of an app-owned webview.
+//! The default browser handles account challenges and popups; Ryotunes imports only the
+//! provider-specific cookies it needs from that browser's local cookie store.
 //!
-//! What gets imported is exactly what the old window harvested — the `oauth_token`,
-//! `oauth_refresh_token` and `connect_session` triple scoped to soundcloud.com — read directly
-//! from the cookie databases of the Gecko and Chromium families (Firefox, Zen, LibreWolf, …,
-//! Chromium, Chrome, Brave, Vivaldi, Edge), including Flatpak and snap layouts. Only rows whose
-//! host matches soundcloud.com are ever selected; no other cookie is read, and values are never
-//! logged. A running browser keeps its database locked, so each store is copied (with its WAL)
-//! to a private temp dir and read from the copy.
+//! SoundCloud imports its auth-cookie triple; Spotify imports only `sp_dc`. Each query is
+//! restricted to its provider's domain and exact cookie names, and cookie values are never logged.
+//! Supported Gecko and Chromium stores include Firefox, Zen, LibreWolf, Chrome, Brave, Vivaldi and
+//! similar profiles, including Flatpak and snap layouts. A running browser keeps its database
+//! locked, so each store is copied (with its WAL) to a private temp dir and read from the copy.
 //!
 //! The user may already be signed in — the first pass then completes the sign-in immediately.
 //! Otherwise the caller polls until a valid triple appears or the window times out.
@@ -22,9 +17,10 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OpenFlags};
 use ryotunes_soundcloud::SoundcloudAuth;
 
-/// Where the user is sent: the site's own sign-in page (account form + IdP buttons), which in a
-/// real browser has working captchas and popups.
+/// SoundCloud's site-specific sign-in page.
 pub const SIGN_IN_URL: &str = "https://soundcloud.com/signin";
+/// Spotify's account site, which redirects into sign-in when the user has no active session.
+pub const SPOTIFY_SIGN_IN_URL: &str = "https://accounts.spotify.com/";
 
 /// The three cookies that make a SoundCloud web session.
 const COOKIE_NAMES: [&str; 3] = ["oauth_token", "oauth_refresh_token", "connect_session"];
@@ -47,23 +43,41 @@ pub struct Store {
 /// Hand the sign-in page to the system default browser. True when the launcher spawned; the
 /// user still has to actually sign in there.
 pub fn open_in_default_browser() -> bool {
-    let mut command = std::process::Command::new("xdg-open");
-    command
-        .arg(SIGN_IN_URL)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    match command.spawn() {
-        Ok(mut child) => {
-            // xdg-open usually exits immediately, but a chooser dialog may linger; reap it on a
-            // blocking thread so a tokio worker never parks in `wait`.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-            true
-        }
+    open_url_in_default_browser(SIGN_IN_URL, "SoundCloud")
+}
+
+/// Open Spotify in the system default browser so its real account flow and popups work.
+pub fn open_spotify_in_default_browser() -> bool {
+    open_url_in_default_browser(SPOTIFY_SIGN_IN_URL, "Spotify")
+}
+
+fn open_url_in_default_browser(url: &str, provider: &str) -> bool {
+    open_url_with(url, provider, |url| {
+        let mut command = std::process::Command::new("xdg-open");
+        command
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn()?;
+        // xdg-open usually exits immediately, but a chooser dialog may linger; reap it on a
+        // blocking thread so a tokio worker never parks in `wait`.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
+    })
+}
+
+fn open_url_with(
+    url: &str,
+    provider: &str,
+    launch: impl FnOnce(&str) -> std::io::Result<()>,
+) -> bool {
+    match launch(url) {
+        Ok(()) => true,
         Err(error) => {
-            tracing::warn!(error = %error, "could not launch the default browser for SoundCloud sign-in");
+            tracing::warn!(error = %error, provider, "could not launch the default browser for sign-in");
             false
         }
     }
@@ -77,14 +91,19 @@ pub fn import_any() -> Option<SoundcloudAuth> {
     import_from(&discover())
 }
 
+/// Read only Spotify's `sp_dc` session cookie from the user's discovered browser stores.
+pub fn import_spotify_cookie() -> Option<String> {
+    import_cookie_from(&discover(), "spotify", "spotify.com", "sp_dc")
+}
+
 fn import_from(stores: &[Store]) -> Option<SoundcloudAuth> {
     for store in stores {
-        if !changed_since_last_look(&store.path) {
+        if !changed_since_last_look(&store.path, "soundcloud") {
             continue;
         }
         let cookies = match store.kind {
-            Kind::Gecko => read_gecko(&store.path),
-            Kind::Chromium => read_chromium(&store.path),
+            Kind::Gecko => read_gecko(&store.path, "soundcloud.com", &COOKIE_NAMES),
+            Kind::Chromium => read_chromium(&store.path, "soundcloud.com", &COOKIE_NAMES),
         };
         let Some(cookies) = cookies else { continue };
         if let Some(auth) = harvest(cookies) {
@@ -95,11 +114,35 @@ fn import_from(stores: &[Store]) -> Option<SoundcloudAuth> {
     None
 }
 
+fn import_cookie_from(
+    stores: &[Store],
+    scope: &str,
+    domain: &str,
+    cookie_name: &str,
+) -> Option<String> {
+    let names = [cookie_name];
+    for store in stores {
+        if !changed_since_last_look(&store.path, scope) {
+            continue;
+        }
+        let Some(cookies) = (match store.kind {
+            Kind::Gecko => read_gecko(&store.path, domain, &names),
+            Kind::Chromium => read_chromium(&store.path, domain, &names),
+        }) else {
+            continue;
+        };
+        if let Some(value) = harvest_cookie(cookies, domain, cookie_name) {
+            return Some(value);
+        }
+    }
+    None
+}
+
 /// True when a store's database or WAL journal changed since the previous scan (or was never
 /// scanned / cannot be stat'ed — err toward reading it). The memo is process-wide and only
 /// ever consulted by the sign-in poller, so a stale entry costs one re-read, never a miss.
-fn changed_since_last_look(path: &Path) -> bool {
-    static SEEN: std::sync::LazyLock<parking_lot::Mutex<BTreeMap<PathBuf, (i64, i64)>>> =
+fn changed_since_last_look(path: &Path, scope: &str) -> bool {
+    static SEEN: std::sync::LazyLock<parking_lot::Mutex<BTreeMap<(PathBuf, String), (i64, i64)>>> =
         std::sync::LazyLock::new(|| parking_lot::Mutex::new(BTreeMap::new()));
     let stamp = |p: &Path| {
         std::fs::metadata(&p)
@@ -113,32 +156,50 @@ fn changed_since_last_look(path: &Path) -> bool {
     };
     let current = (stamp(path), stamp(&PathBuf::from(format!("{}-wal", path.display()))));
     let mut seen = SEEN.lock();
-    if seen.get(path) == Some(&current) {
+    let key = (path.to_path_buf(), scope.to_owned());
+    if seen.get(&key) == Some(&current) {
         return false;
     }
-    seen.insert(path.to_path_buf(), current);
+    seen.insert(key, current);
     true
 }
 
 /// Pick the token triple out of raw `(name, value, domain)` cookie rows. Domain-matched by
 /// hand: anything outside soundcloud.com is dropped even if a store somehow returned it.
 pub fn harvest(cookies: Vec<(String, String, String)>) -> Option<SoundcloudAuth> {
-    let mut jar = BTreeMap::new();
-    for (name, value, domain) in cookies {
-        let domain = domain.strip_prefix('.').map(str::to_owned).unwrap_or(domain);
-        if domain != "soundcloud.com" && !domain.ends_with(".soundcloud.com") {
-            continue;
-        }
-        if COOKIE_NAMES.contains(&name.as_str()) {
-            jar.insert(name, value);
-        }
-    }
+    let mut jar = harvest_domain_cookies(cookies, "soundcloud.com", &COOKIE_NAMES);
     let access = jar.remove("oauth_token")?;
     SoundcloudAuth::from_access_token(
         access,
         jar.remove("oauth_refresh_token"),
         jar.remove("connect_session"),
     )
+}
+
+fn harvest_cookie(
+    cookies: Vec<(String, String, String)>,
+    domain: &str,
+    cookie_name: &str,
+) -> Option<String> {
+    harvest_domain_cookies(cookies, domain, &[cookie_name]).remove(cookie_name)
+}
+
+fn harvest_domain_cookies(
+    cookies: Vec<(String, String, String)>,
+    allowed_domain: &str,
+    allowed_names: &[&str],
+) -> BTreeMap<String, String> {
+    let mut jar = BTreeMap::new();
+    for (name, value, domain) in cookies {
+        let domain = domain.strip_prefix('.').unwrap_or(&domain);
+        if domain != allowed_domain && !domain.ends_with(&format!(".{allowed_domain}")) {
+            continue;
+        }
+        if allowed_names.contains(&name.as_str()) && !value.is_empty() {
+            jar.insert(name, value);
+        }
+    }
+    jar
 }
 
 // --- discovery --------------------------------------------------------------------------------
@@ -169,7 +230,7 @@ fn candidate_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// All cookie databases that could hold a SoundCloud session, Gecko stores first (their values
+/// All cookie databases that could hold a web session, Gecko stores first (their values
 /// are readable without any key material). Bounded so a wild home directory cannot blow up a
 /// poll tick.
 pub fn discover() -> Vec<Store> {
@@ -275,45 +336,52 @@ fn copy_and_open(path: &Path) -> Option<(tempfile::TempDir, Connection)> {
     Some((dir, connection))
 }
 
-fn read_gecko(path: &Path) -> Option<Vec<(String, String, String)>> {
+fn read_gecko(path: &Path, domain: &str, names: &[&str]) -> Option<Vec<(String, String, String)>> {
     let (_dir, connection) = copy_and_open(path)?;
-    let mut statement = connection
-        .prepare(
-            "SELECT name, value, host FROM moz_cookies \
-             WHERE host LIKE '%soundcloud.com' AND name IN (?1, ?2, ?3)",
-        )
-        .ok()?;
-    let rows = statement
-        .query_map(rusqlite::params![COOKIE_NAMES[0], COOKIE_NAMES[1], COOKIE_NAMES[2]], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-        })
-        .ok()?;
-    Some(rows.flatten().collect())
+    let mut out = Vec::new();
+    for name in names {
+        let mut statement = connection
+            .prepare("SELECT name, value, host FROM moz_cookies WHERE host LIKE ?1 AND name = ?2")
+            .ok()?;
+        let rows = statement
+            .query_map(rusqlite::params![format!("%{domain}"), name], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })
+            .ok()?;
+        out.extend(rows.flatten());
+    }
+    Some(out)
 }
 
-fn read_chromium(path: &Path) -> Option<Vec<(String, String, String)>> {
+fn read_chromium(
+    path: &Path,
+    domain: &str,
+    names: &[&str],
+) -> Option<Vec<(String, String, String)>> {
     let (_dir, connection) = copy_and_open(path)?;
-    let mut statement = connection
-        .prepare(
-            "SELECT name, host_key, encrypted_value, value FROM cookies \
-             WHERE host_key LIKE '%soundcloud.com' AND name IN (?1, ?2, ?3)",
-        )
-        .ok()?;
-    let rows = statement
-        .query_map(rusqlite::params![COOKIE_NAMES[0], COOKIE_NAMES[1], COOKIE_NAMES[2]], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-            ))
-        })
-        .ok()?;
     let mut out = Vec::new();
-    for row in rows.flatten() {
-        let (name, host, encrypted, plain) = row;
-        if let Some(value) = chromium_value(&encrypted, &plain, &host) {
-            out.push((name, value, host));
+    for name in names {
+        let mut statement = connection
+            .prepare(
+                "SELECT name, host_key, encrypted_value, value FROM cookies \
+                 WHERE host_key LIKE ?1 AND name = ?2",
+            )
+            .ok()?;
+        let rows = statement
+            .query_map(rusqlite::params![format!("%{domain}"), name], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .ok()?;
+        for row in rows.flatten() {
+            let (name, host, encrypted, plain) = row;
+            if let Some(value) = chromium_value(&encrypted, &plain, &host) {
+                out.push((name, value, host));
+            }
         }
     }
     Some(out)
@@ -370,6 +438,49 @@ fn sha256(input: &str) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spotify_default_browser_launches_the_accounts_site() {
+        let mut opened = None;
+        assert!(open_url_with(SPOTIFY_SIGN_IN_URL, "Spotify", |url| {
+            opened = Some(url.to_owned());
+            Ok(())
+        }));
+        assert_eq!(opened.as_deref(), Some("https://accounts.spotify.com/"));
+    }
+
+    #[test]
+    fn spotify_cookie_import_reads_only_sp_dc_from_spotify_domains() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = seed_gecko(
+            temp.path(),
+            "spotify-profile",
+            &[
+                (".spotify.com", "sp_dc", "session-cookie"),
+                ("accounts.spotify.com", "sp_key", "unneeded"),
+                (".notspotify.com", "sp_dc", "wrong-domain"),
+                (".example.com", "sp_dc", "unrelated"),
+            ],
+        );
+        let stores = vec![Store { kind: Kind::Gecko, path }];
+
+        let cookie = import_cookie_from(&stores, "spotify-test", "spotify.com", "sp_dc");
+
+        assert_eq!(cookie.as_deref(), Some("session-cookie"));
+    }
+
+    #[test]
+    fn spotify_cookie_import_rejects_non_spotify_domains() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = seed_gecko(
+            temp.path(),
+            "spotify-decoy-profile",
+            &[(".notspotify.com", "sp_dc", "wrong-domain")],
+        );
+        let stores = vec![Store { kind: Kind::Gecko, path }];
+
+        assert!(import_cookie_from(&stores, "spotify-decoy-test", "spotify.com", "sp_dc").is_none());
+    }
 
     fn fake_jwt(expiry: i64) -> String {
         let header = base64::Engine::encode(

@@ -26,6 +26,16 @@ function dragging(v) {
     return typeof v === "number" && !isNaN(v);
 }
 
+// A playlist's primary Play action starts at its first item. Prefetch only after the user hovers
+// that action, and only when the first row needs the Spotify Free → YouTube fallback.
+function freeSpotifyFirstTrack(items, metadataOnly, primaryHovered) {
+    if (!metadataOnly || !primaryHovered || !Array.isArray(items) || !items.length)
+        return null;
+    var first = items[0];
+    return first && typeof first.video_id === "string"
+        && first.video_id.indexOf("spotify:track:") === 0 ? first : null;
+}
+
 // Apply one daemon event to `s`. Returns a { toast, kind } descriptor for the events that surface a
 // message, else null. Event payload shapes are the daemon's, verified against ryotunesd: position
 // and duration wrap their value in an object; playback-state and volume are bare scalars.
@@ -94,27 +104,33 @@ function applyEvent(s, name, data) {
         s.provider = data.provider;
         return null;
     case "spotify-auth": {
-        // The Spotify OAuth flow's progress, surfaced by the daemon; no provider-changed rides with
-        // it. The url step is opened in the browser by the caller (a JS library cannot reach
-        // Quickshell), so it returns an openUrl the Playback singleton hands to execDetached.
+        // Premium OAuth asks the client to open its authorization URL; metadata-only mode has the
+        // daemon open the default browser and emits waiting while it watches for sp_dc.
         var st = (data && data.state) ? data.state : "";
         if (st === "url") {
             s.spotify = Object.assign({}, s.spotify, { flow: "browser", error: "" });
             return { toast: "Opening Spotify sign-in in your browser", kind: "info", openUrl: data.url };
         }
+        if (st === "waiting") {
+            var waitingMessage = "Finish signing in to Spotify in your browser. Ryotunes will connect automatically.";
+            s.spotify = Object.assign({}, s.spotify, { flow: "browser", error: waitingMessage });
+            return { toast: "Opened Spotify in your browser; Ryotunes is waiting for sign-in", kind: "info" };
+        }
         if (st === "signed_in") {
             s.spotify = { signedIn: true, stored: true, name: (data && data.name) ? data.name : null,
-                premium: (s.spotify && s.spotify.premium !== undefined) ? s.spotify.premium : null,
+                premium: data && data.premium !== undefined ? data.premium : null,
+                metadataOnly: !!(data && data.metadataOnly),
                 flow: "", error: "" };
             return { toast: "Signed in to Spotify" + ((data && data.name) ? (" as " + data.name) : ""), kind: "success" };
         }
         if (st === "restored") {
             // The startup restore finished after this client's opening snapshot was taken --
             // the fix for the sign-in gate that reappeared on every launch. Restore is gated
-            // on Premium, so premium is known true; the display name arrives with a snapshot.
+            // under the selected auth mode; the display name arrives with a snapshot.
             s.spotify = { signedIn: true, stored: true,
                 name: (s.spotify && s.spotify.name) ? s.spotify.name : null,
-                premium: true, flow: "", error: "" };
+                premium: !!(data && data.premium), metadataOnly: !!(data && data.metadataOnly),
+                flow: "", error: "" };
             return null;
         }
         if (st === "restore_failed") {
@@ -125,7 +141,7 @@ function applyEvent(s, name, data) {
             return null;
         }
         if (st === "signed_out") {
-            s.spotify = { signedIn: false, stored: false, name: null, premium: null };
+            s.spotify = { signedIn: false, stored: false, name: null, premium: null, metadataOnly: false };
             return null;
         }
         if (st === "error") {

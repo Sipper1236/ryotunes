@@ -173,6 +173,13 @@ pub struct AppState {
     /// so there is no live handle to hold; unlike SoundCloud it has no guest catalogue, so every
     /// call needs a session.
     pub tidal: Arc<ryotunes_tidal::Tidal>,
+    /// Full-fidelity, short-lived streams resolved for Spotify Free tracks. These cannot use the
+    /// SQLite URL cache because mpv may need per-request headers/options; retaining the PlaybackData
+    /// lets a hover prefetch feed the later Play without repeating Spotify metadata + YouTube work.
+    spotify_fallback_cache: parking_lot::Mutex<SpotifyFallbackCache>,
+    /// A small fixed set of async locks coalesces a prefetch and a click for the same Spotify track
+    /// without keeping an unbounded lock per track.
+    spotify_fallback_locks: [tokio::sync::Mutex<()>; 16],
     /// Play/like/genre for SoundCloud tracks seen by `resolve`, keyed by `sc:track:` id, so the
     /// now-playing snapshot can render the meta line without another round-trip. Bounded in
     /// `remember_sc_meta`.
@@ -196,6 +203,88 @@ struct ScTrackMeta {
     plays: Option<String>,
     likes: Option<String>,
     genre: Option<String>,
+}
+
+#[derive(Default)]
+struct SpotifyFallbackCache {
+    entries: std::collections::HashMap<String, SpotifyFallbackEntry>,
+}
+
+struct SpotifyFallbackEntry {
+    data: PlaybackData,
+    inserted_at: std::time::Instant,
+    expires_at: std::time::Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SpotifyFallbackMetadata {
+    title: String,
+    artists: String,
+    duration_ms: i64,
+}
+
+fn spotify_fallback_metadata(item: &SongItem) -> Option<SpotifyFallbackMetadata> {
+    if crate::spotify::spotify_track_id(&item.video_id).is_none() || item.title.trim().is_empty() {
+        return None;
+    }
+    Some(SpotifyFallbackMetadata {
+        title: item.title.trim().to_owned(),
+        artists: item.artists.trim().to_owned(),
+        duration_ms: parse_duration_ms(item.duration.as_deref()),
+    })
+}
+
+/// Pick a playable YouTube Music row for a Spotify Free track. Search ranking supplies the
+/// fallback when durations are absent or none are close; a close-duration row wins when present.
+fn spotify_youtube_candidate(items: &[SongItem], expected_duration_ms: i64) -> Option<&SongItem> {
+    let first = items.first()?;
+    if expected_duration_ms <= 0 {
+        return Some(first);
+    }
+    items
+        .iter()
+        .find(|item| {
+            let actual = parse_duration_ms(item.duration.as_deref());
+            actual > 0 && (expected_duration_ms - actual).abs() <= 10_000
+        })
+        .or(Some(first))
+}
+
+impl SpotifyFallbackCache {
+    const MAX_ENTRIES: usize = 32;
+    const MAX_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+    const EXPIRY_MARGIN: i64 = 60;
+
+    fn get(&mut self, key: &str, now: std::time::Instant) -> Option<PlaybackData> {
+        self.entries.retain(|_, entry| entry.expires_at > now);
+        self.entries.get(key).map(|entry| entry.data.clone())
+    }
+
+    fn insert(&mut self, key: String, data: PlaybackData, now: std::time::Instant) {
+        let ttl = data.expires_in_seconds.saturating_sub(Self::EXPIRY_MARGIN);
+        if ttl <= 0 {
+            return;
+        }
+        self.entries.retain(|_, entry| entry.expires_at > now);
+        if !self.entries.contains_key(&key) && self.entries.len() >= Self::MAX_ENTRIES {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_at)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            key,
+            SpotifyFallbackEntry {
+                data,
+                inserted_at: now,
+                expires_at: now + std::time::Duration::from_secs(ttl as u64).min(Self::MAX_TTL),
+            },
+        );
+    }
 }
 
 /// Repeat mode for the queue. Serialized lowercase for the UI + `queue_json`.
@@ -438,12 +527,11 @@ impl AppState {
             .and_then(crate::spotify::Provider::parse)
             .unwrap_or(crate::spotify::Provider::Youtube);
         let metadata_only = db.get_setting("spotify_metadata_only").as_deref() == Some("true");
-        let spotify =
-            Arc::new(crate::spotify::SpotifyState::new(
-                paths.data_dir.join("spotify"),
-                selected,
-                metadata_only,
-            ));
+        let spotify = Arc::new(crate::spotify::SpotifyState::new(
+            paths.data_dir.join("spotify"),
+            selected,
+            metadata_only,
+        ));
         let soundcloud =
             Arc::new(ryotunes_soundcloud::SoundCloud::new(paths.data_dir.join("soundcloud")));
         // A captured SoundCloud sign-in survives restarts like the YouTube cookie does: the
@@ -501,6 +589,8 @@ impl AppState {
             spotify,
             soundcloud,
             tidal,
+            spotify_fallback_cache: parking_lot::Mutex::new(SpotifyFallbackCache::default()),
+            spotify_fallback_locks: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
             sc_meta: parking_lot::Mutex::new(std::collections::HashMap::new()),
             last_visitor_try: AtomicU64::new(0),
             queue: Mutex::new(QueueState::default()),
@@ -925,6 +1015,42 @@ impl AppState {
         Ok(())
     }
 
+    fn spotify_fallback_cache_key(&self, video_id: &str) -> String {
+        let mut disabled = self.disabled_clients().into_iter().collect::<Vec<_>>();
+        disabled.sort();
+        let quality = self.db.get_setting("quality").unwrap_or_else(|| "HIGH".into());
+        format!("{video_id}\n{quality}\n{}", disabled.join(","))
+    }
+
+    async fn resolve_spotify_fallback_cached(
+        self: &std::sync::Arc<Self>,
+        track_id: &str,
+        video_id: &str,
+        metadata: Option<SpotifyFallbackMetadata>,
+    ) -> Result<PlaybackData, ResolveError> {
+        let key = self.spotify_fallback_cache_key(video_id);
+        if let Some(data) = self.spotify_fallback_cache.lock().get(&key, std::time::Instant::now())
+        {
+            return Ok(data);
+        }
+
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let lock_index = hasher.finish() as usize % self.spotify_fallback_locks.len();
+        let _guard = self.spotify_fallback_locks[lock_index].lock().await;
+        if let Some(data) = self.spotify_fallback_cache.lock().get(&key, std::time::Instant::now())
+        {
+            return Ok(data);
+        }
+
+        // A row hover can prefetch while the same track is clicked. The keyed lock makes the
+        // click await that resolve instead of issuing a second Spotify lookup and YouTube stream
+        // waterfall. The bounded cache retains the full headers/options needed by mpv.
+        let data = self.resolve_spotify_via_youtube(track_id, video_id, metadata).await?;
+        self.spotify_fallback_cache.lock().insert(key, data.clone(), std::time::Instant::now());
+        Ok(data)
+    }
+
     async fn resolve(
         self: &std::sync::Arc<Self>,
         video_id: &str,
@@ -958,10 +1084,9 @@ impl AppState {
                 .ok_or_else(|| ResolveError::AllClientsFailed(video_id.to_owned()))?;
             return Ok(crate::radio::playback_data(&station));
         }
-        // A Spotify track streams as raw PCM through a per-session FIFO, not a cacheable URL, so it
-        // resolves ahead of the latency cache / HEAD / orchestrator path and never touches any of
-        // them. Opening the stream starts librespot decoding into the FIFO immediately; mpv is
-        // pointed at that FIFO with the rawaudio demuxer options.
+        // A Premium Spotify track streams as raw PCM through a per-session FIFO, not a cacheable
+        // URL. A free metadata-only account instead gets a short-lived, full-fidelity cached
+        // YouTube fallback so hovering a row can make the later click immediate.
         if let Some(tid) = crate::spotify::spotify_track_id(video_id) {
             let Some(client) = self.spotify.client().await else {
                 return Err(ResolveError::SignInRequired(
@@ -970,7 +1095,7 @@ impl AppState {
             };
             // If in metadata-only mode (free account), search YouTube Music for the track instead.
             if self.spotify.is_metadata_only() {
-                return self.resolve_spotify_via_youtube(tid, video_id).await;
+                return self.resolve_spotify_fallback_cached(tid, video_id, None).await;
             }
             let handle = client
                 .stream(tid)
@@ -1173,49 +1298,92 @@ impl AppState {
         Ok(data)
     }
 
+    /// Resolve a queue item while preserving metadata already supplied by Spotify. That metadata
+    /// avoids a serial Spotify track lookup before the YouTube Music search on free accounts.
+    async fn resolve_song(
+        self: &std::sync::Arc<Self>,
+        item: &SongItem,
+    ) -> Result<PlaybackData, ResolveError> {
+        if self.spotify.is_metadata_only() {
+            if let Some(track_id) = crate::spotify::spotify_track_id(&item.video_id) {
+                if self.spotify.client().await.is_none() {
+                    return Err(ResolveError::SignInRequired(
+                        "Sign in to Spotify to play this".to_owned(),
+                    ));
+                }
+                return self
+                    .resolve_spotify_fallback_cached(
+                        track_id,
+                        &item.video_id,
+                        spotify_fallback_metadata(item),
+                    )
+                    .await;
+            }
+        }
+        self.resolve(&item.video_id, item.is_upload).await
+    }
+
     /// Resolve a Spotify track via YouTube Music search (metadata-only mode for free accounts).
     /// Fetches the track metadata from Spotify, searches YouTube Music, and returns YouTube playback data.
     async fn resolve_spotify_via_youtube(
         self: &std::sync::Arc<Self>,
         spotify_track_id: &str,
         original_video_id: &str,
+        metadata: Option<SpotifyFallbackMetadata>,
     ) -> Result<PlaybackData, ResolveError> {
-        let client = self
-            .spotify
-            .client()
-            .await
-            .ok_or_else(|| ResolveError::SignInRequired("Sign in to Spotify to play this".to_owned()))?;
+        let client = self.spotify.client().await.ok_or_else(|| {
+            ResolveError::SignInRequired("Sign in to Spotify to play this".to_owned())
+        })?;
 
-        // Fetch track metadata from Spotify
-        let track = client
-            .track(spotify_track_id)
-            .await
-            .map_err(|e| ResolveError::AllClientsFailed(format!("{original_video_id}: {e}")))?;
-
-        // Build search query: "track_name artist1 artist2"
-        let search_query = if !track.artists.is_empty() {
-            format!("{} {}", track.name, track.artists)
+        // Search/list items already carry these fields. Use them on the normal playback path and
+        // only fetch Spotify metadata for restored or otherwise incomplete queue entries.
+        let metadata = match metadata {
+            Some(metadata) => metadata,
+            None => {
+                let track = client.track(spotify_track_id).await.map_err(|e| {
+                    ResolveError::AllClientsFailed(format!("{original_video_id}: {e}"))
+                })?;
+                SpotifyFallbackMetadata {
+                    title: track.name,
+                    artists: track.artists,
+                    duration_ms: track.duration.as_millis() as i64,
+                }
+            }
+        };
+        let search_query = if !metadata.artists.is_empty() {
+            format!("{} {}", metadata.title, metadata.artists)
         } else {
-            track.name.clone()
+            metadata.title.clone()
         };
 
         tracing::info!(spotify_track_id = %spotify_track_id, query = %search_query, "Resolving Spotify track via YouTube Music fallback");
 
-        // Search YouTube Music
+        // InnerTube's playback resolver needs a video ID, not a search string. Resolve the
+        // Spotify title/artist query through the metadata client first, preferring a duration
+        // match when available, then pass the chosen YouTube ID into stream selection.
+        let expected_ms = metadata.duration_ms;
+        let metadata_client = self
+            .metadata_client()
+            .map_err(|e| ResolveError::AllClientsFailed(format!("YouTube Music search: {e}")))?;
+        let search =
+            self.it.search_songs(metadata_client, &search_query).await.map_err(|e| {
+                ResolveError::AllClientsFailed(format!("YouTube Music search: {e}"))
+            })?;
+        let Some(candidate) = spotify_youtube_candidate(&search.items, expected_ms) else {
+            return Err(ResolveError::AllClientsFailed(format!(
+                "No YouTube Music match for Spotify track {spotify_track_id}"
+            )));
+        };
+        let youtube_video_id = candidate.video_id.clone();
+        let youtube_is_upload = candidate.is_upload;
         let results = self
             .orchestrator
-            .resolve(
-                &search_query,
-                false,
-                self.quality(),
-                &self.disabled_clients(),
-            )
+            .resolve(&youtube_video_id, youtube_is_upload, self.quality(), &self.disabled_clients())
             .await;
 
         match results {
             Ok(playback_data) => {
                 // Verify duration proximity (within 10 seconds) to reduce wrong-match risk
-                let expected_ms = track.duration.as_millis() as i64;
                 if expected_ms > 0 {
                     if let Some(yt_duration_str) = &playback_data.duration {
                         let actual_ms = parse_duration_ms(Some(yt_duration_str));
@@ -1293,11 +1461,21 @@ impl AppState {
     /// The UI calls this only after settled search intent / a short hover, so a subsequent Play can
     /// skip the /player + PoToken + HEAD waterfall and go straight to mpv. Failures are silent.
     pub async fn prefetch_stream(self: &std::sync::Arc<Self>, video_id: String, is_upload: bool) {
-        // A Spotify id would open a real librespot stream into the shared FIFO — never on spec.
-        if crate::spotify::is_spotify_id(&video_id) {
+        // Premium Spotify would open a real librespot stream into the shared FIFO — never on
+        // spec. Free metadata tracks use the YouTube fallback and are safe to prefetch.
+        if crate::spotify::is_spotify_id(&video_id) && !self.spotify.is_metadata_only() {
             return;
         }
         let _ = self.resolve(&video_id, is_upload).await;
+    }
+
+    /// Prefetch a visible row with its existing metadata so a Spotify Free resolve can skip the
+    /// preliminary Spotify track request as well as overlap stream resolution with the hover.
+    pub async fn prefetch_song(self: &std::sync::Arc<Self>, item: SongItem) {
+        if crate::spotify::is_spotify_id(&item.video_id) && !self.spotify.is_metadata_only() {
+            return;
+        }
+        let _ = self.resolve_song(&item).await;
     }
 
     /// Start one Internet Radio station as a native live stream. Listen Together deliberately
@@ -1661,7 +1839,6 @@ impl AppState {
         // Note: ~5k tracks at 100/page. A bound so a playlist that keeps handing out tokens
         // can't walk forever; raise it if a real playlist ever hits the cap.
         const MAX_PAGES: usize = 50;
-        let Some(client) = self.clients.get(innertube::METADATA_CLIENT) else { return };
         let mut pages = 0;
         // The first page goes out at once so the panel visibly starts filling; after that the
         // walk emits at most once a second. Every page is a *full* payload (the rows changed),
@@ -1669,21 +1846,46 @@ impl AppState {
         // `webview.eval` if each one is announced. The final state is emitted after the loop.
         let mut last_emit: Option<std::time::Instant> = None;
         for _ in 0..MAX_PAGES {
-            let page = match self.it.playlist_continuation(client, &token).await {
-                Ok(page) => page,
-                // A page that fails ends the walk — better a short queue than a stalled one.
-                Err(e) => {
-                    tracing::warn!(error = %e, "playlist fill stopped early");
+            let (mut items, continuation) = if let Some((playlist_id, page_num)) =
+                crate::spotify::parse_spotify_playlist_continuation(&token)
+            {
+                let Some(spotify) = self.spotify.client().await else {
+                    tracing::warn!("Spotify playlist fill stopped because the account signed out");
                     break;
+                };
+                match spotify.playlist_page(playlist_id, page_num).await {
+                    Ok(detail) => {
+                        let mut page = crate::spotify_bridge::playlist_page(&detail, None, false);
+                        page.continuation = (page.items.len() >= 50).then(|| {
+                            crate::spotify::spotify_playlist_continuation(
+                                playlist_id,
+                                page_num.saturating_add(1),
+                            )
+                        });
+                        (page.items, page.continuation)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Spotify playlist fill stopped early");
+                        break;
+                    }
+                }
+            } else {
+                let Some(client) = self.clients.get(innertube::METADATA_CLIENT) else { return };
+                match self.it.playlist_continuation(client, &token).await {
+                    Ok(page) => (page.items, page.continuation),
+                    // A page that fails ends the walk — better a short queue than a stalled one.
+                    Err(e) => {
+                        tracing::warn!(error = %e, "playlist fill stopped early");
+                        break;
+                    }
                 }
             };
             if self.generation.load(Ordering::SeqCst) != gen {
                 return; // another queue owns the state now — don't touch it, don't persist
             }
-            if page.items.is_empty() {
+            if items.is_empty() {
                 break; // an empty page is the end, token or not
             }
-            let mut items = page.items;
             // The rest of an added playlist belongs to the same block: same markers, same heading,
             // and its order left alone (shuffle is about the playlist that's playing).
             if let Fill::Queued(from) = &fill {
@@ -1711,7 +1913,7 @@ impl AppState {
                 self.emit_queue().await;
             }
             self.prime_lookahead(gen).await;
-            match page.continuation {
+            match continuation {
                 Some(next) => token = next,
                 None => break,
             }
@@ -1957,7 +2159,7 @@ impl AppState {
                 return false; // user moved on
             }
             let Some(item) = self.current_item().await else { return false };
-            let resolved = self.resolve(&item.video_id, item.is_upload).await;
+            let resolved = self.resolve_song(&item).await;
             // A resolve takes seconds; a skip during it bumps the generation. Re-check before
             // acting on the result: an abandoned failure would otherwise move `current` under the
             // track that's already playing and leave a stale error banner (nothing clears it, the
@@ -2300,7 +2502,12 @@ impl AppState {
             let q = self.queue.lock().await;
             (q.duration, q.items.get(q.current).cloned())
         };
-        let position = self.player.position().unwrap_or_else(|| self.current_position());
+        let playing = self.is_playing.load(Ordering::Relaxed);
+        let position = if use_live_player_position(item.is_some(), playing) {
+            self.player.position().unwrap_or_else(|| self.current_position())
+        } else {
+            self.current_position()
+        };
         self.note_position_sample(position);
         serde_json::json!({
             "now": item.as_ref().map(|i| self.now_playing_json(i, "current")),
@@ -4435,16 +4642,131 @@ impl AppState {
     }
 }
 
+fn use_live_player_position(has_track: bool, playing: bool) -> bool {
+    has_track && playing
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         append_page, backfill_metadata, drop_duplicates, enqueue_at, format_duration,
         guest_insert_index, is_mix, loudness_gain, merge_radio, next_index, parse_duration_ms,
         persist_fingerprint, queue_fingerprint, radio_seed_for, read_personal, shuffle_new_queue,
-        shuffle_upcoming, splice_radio_into, spotify_mpv_options, unshuffled, upcoming_queued,
-        validate_personal_blob, QueueState, RepeatMode, PERSONAL_JSON_KEY,
+        shuffle_upcoming, splice_radio_into, spotify_fallback_metadata, spotify_mpv_options,
+        spotify_youtube_candidate, unshuffled, upcoming_queued, use_live_player_position,
+        validate_personal_blob, QueueState, RepeatMode, SongItem, SpotifyFallbackCache,
+        SpotifyFallbackMetadata, PERSONAL_JSON_KEY,
     };
     use crate::db::Db;
+    use crate::orchestrator::PlaybackData;
+
+    #[test]
+    fn spotify_fallback_cache_preserves_player_data_and_expires_before_the_url() {
+        let now = std::time::Instant::now();
+        let mut cache = SpotifyFallbackCache::default();
+        let data = PlaybackData {
+            video_id: "spotify:track:one".into(),
+            stream_url: "https://stream.example/audio".into(),
+            itag: 140,
+            mpv_options: vec!["demuxer-lavf-o=allowed_extensions=ALL".into()],
+            headers: std::collections::HashMap::from([(
+                "Origin".into(),
+                "https://music.youtube.com".into(),
+            )]),
+            expires_in_seconds: 120,
+            loudness_db: Some(-3.0),
+            playback_ping: None,
+            title: Some("Song".into()),
+            artists: Some("Artist".into()),
+            duration: Some("3:00".into()),
+            thumbnail: None,
+            is_video: Some(false),
+            stream_client: "youtube-fallback".into(),
+        };
+        cache.insert("spotify:track:one|HIGH".into(), data.clone(), now);
+        let cached =
+            cache.get("spotify:track:one|HIGH", now + std::time::Duration::from_secs(59)).unwrap();
+        assert_eq!(cached.stream_url, data.stream_url);
+        assert_eq!(cached.mpv_options, data.mpv_options);
+        assert_eq!(cached.headers, data.headers);
+        assert!(cache
+            .get("spotify:track:one|HIGH", now + std::time::Duration::from_secs(61))
+            .is_none());
+
+        data_no_cache_expiry();
+    }
+
+    fn data_no_cache_expiry() {
+        let now = std::time::Instant::now();
+        let mut cache = SpotifyFallbackCache::default();
+        let data = PlaybackData {
+            video_id: "spotify:track:short".into(),
+            stream_url: "short".into(),
+            itag: 0,
+            mpv_options: Vec::new(),
+            headers: std::collections::HashMap::new(),
+            expires_in_seconds: 60,
+            loudness_db: None,
+            playback_ping: None,
+            title: None,
+            artists: None,
+            duration: None,
+            thumbnail: None,
+            is_video: None,
+            stream_client: "youtube-fallback".into(),
+        };
+        cache.insert("short".into(), data, now);
+        assert!(cache.get("short", now).is_none());
+    }
+
+    #[test]
+    fn spotify_youtube_fallback_prefers_close_duration_and_returns_a_video_id() {
+        let items = vec![
+            SongItem {
+                video_id: "wrong-cut".into(),
+                duration: Some("3:00".into()),
+                ..Default::default()
+            },
+            SongItem {
+                video_id: "right-cut".into(),
+                duration: Some("3:21".into()),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(spotify_youtube_candidate(&items, 200_000).unwrap().video_id, "right-cut");
+        assert_eq!(spotify_youtube_candidate(&items, 0).unwrap().video_id, "wrong-cut");
+        assert!(spotify_youtube_candidate(&[], 200_000).is_none());
+    }
+
+    #[test]
+    fn spotify_fallback_reuses_queue_metadata_and_parses_its_duration() {
+        let item = SongItem {
+            video_id: "spotify:track:track-id".into(),
+            title: "Song title".into(),
+            artists: "Artist One & Artist Two".into(),
+            duration: Some("4:22".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            spotify_fallback_metadata(&item),
+            Some(SpotifyFallbackMetadata {
+                title: "Song title".into(),
+                artists: "Artist One & Artist Two".into(),
+                duration_ms: 262_000,
+            })
+        );
+
+        let incomplete = SongItem { title: "  ".into(), ..item };
+        assert!(spotify_fallback_metadata(&incomplete).is_none());
+    }
+
+    #[test]
+    fn playback_snapshot_queries_player_only_for_an_active_track() {
+        assert!(!use_live_player_position(false, false));
+        assert!(!use_live_player_position(false, true));
+        assert!(!use_live_player_position(true, false));
+        assert!(use_live_player_position(true, true));
+    }
 
     #[test]
     fn personal_round_trips_and_rejects_bad_blobs() {

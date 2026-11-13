@@ -7,13 +7,15 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use innertube::{BrowseItem, PlaylistPage, PlaylistSort, Rating, SongItem, YouTubeClient};
 use ryotunes_core::db::LocalPlaylist;
 use ryotunes_core::soundcloud_bridge;
 use ryotunes_core::spotify::{
-    is_sc_id, is_tidal_id, sc_playlist_id, sc_system_id, sc_track_id, sc_user_id, spotify_track_id,
-    tidal_album_id, tidal_artist_id, tidal_playlist_id, Provider,
+    is_sc_id, is_tidal_id, parse_spotify_playlist_continuation, sc_playlist_id, sc_system_id,
+    sc_track_id, sc_user_id, spotify_playlist_continuation, spotify_track_id, tidal_album_id,
+    tidal_artist_id, tidal_playlist_id, Provider,
 };
 use ryotunes_core::spotify_bridge;
 use ryotunes_core::state::{
@@ -58,6 +60,12 @@ fn null() -> Result<Value, ErrorBody> {
     Ok(Value::Null)
 }
 
+fn log_snapshot_stage(stage: &'static str, elapsed: Duration) {
+    if elapsed >= Duration::from_millis(100) {
+        tracing::warn!(target: "ryotunesd::performance", stage, elapsed_ms = elapsed.as_millis(), "slow subscribe snapshot stage");
+    }
+}
+
 // --- Spotify routing --------------------------------------------------------------------------
 
 /// Guards the sign-in flow so two OAuth attempts never run at once (it is fire-and-forget).
@@ -66,9 +74,54 @@ static SPOTIFY_SIGNING_IN: AtomicBool = AtomicBool::new(false);
 /// again because the browser never opened, or closed it) reopens the same page instead of
 /// answering "started" and doing nothing visible.
 static SPOTIFY_AUTH_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+const SPOTIFY_DISPLAY_NAME_KEY: &str = "spotify_display_name";
 /// One `client.liked` page (mirrors the crate's private `LIKED_PAGE`); the liked-songs view pages
 /// until a batch comes back short.
-const SPOTIFY_LIKED_PAGE: usize = 100;
+const SPOTIFY_LIKED_PAGE: usize = 50;
+const SPOTIFY_PLAYLIST_PAGE: usize = 50;
+const SPOTIFY_LIKED_TOKEN_PREFIX: &str = "ryotunes:spotify-liked:v1";
+
+fn spotify_liked_token(page: u32, sort: PlaylistSort, desc: bool) -> String {
+    let sort = match sort {
+        PlaylistSort::Default => "default",
+        PlaylistSort::Newest => "newest",
+        PlaylistSort::Oldest => "oldest",
+        PlaylistSort::Title => "title",
+        PlaylistSort::Artist => "artist",
+        PlaylistSort::Album => "album",
+        PlaylistSort::Top => "top",
+    };
+    format!("{SPOTIFY_LIKED_TOKEN_PREFIX}:{page}:{sort}:{}", if desc { 1 } else { 0 })
+}
+
+fn parse_spotify_liked_token(token: &str) -> Option<(u32, PlaylistSort, bool)> {
+    let mut parts = token.strip_prefix(SPOTIFY_LIKED_TOKEN_PREFIX)?.strip_prefix(':')?.split(':');
+    let page = parts.next()?.parse().ok()?;
+    let sort = match parts.next()? {
+        "default" => PlaylistSort::Default,
+        "newest" => PlaylistSort::Newest,
+        "oldest" => PlaylistSort::Oldest,
+        "title" => PlaylistSort::Title,
+        "artist" => PlaylistSort::Artist,
+        "album" => PlaylistSort::Album,
+        "top" => PlaylistSort::Top,
+        _ => return None,
+    };
+    let desc = match parts.next()? {
+        "0" => false,
+        "1" => true,
+        _ => return None,
+    };
+    parts.next().is_none().then_some((page, sort, desc))
+}
+
+fn spotify_liked_can_page(metadata_only: bool, sort: Option<PlaylistSort>, desc: bool) -> bool {
+    metadata_only && !desc && sort.is_none_or(|sort| sort == PlaylistSort::Newest)
+}
+
+fn spotify_playlist_can_page(metadata_only: bool, sort: Option<PlaylistSort>, desc: bool) -> bool {
+    metadata_only && !desc && sort.is_none_or(|sort| sort == PlaylistSort::Default)
+}
 
 /// Resets [`SPOTIFY_SIGNING_IN`] whenever the spawned flow ends — success, failure or panic.
 struct SignInGuard;
@@ -85,12 +138,57 @@ static SC_SIGNING_IN: AtomicBool = AtomicBool::new(false);
 /// user gets to finish signing in there before the flow gives up.
 const SC_SIGN_IN_POLL_SECS: u64 = 2;
 const SC_SIGN_IN_TIMEOUT_SECS: u64 = 5 * 60;
+/// Browser cookie import cadence and deadline for Spotify's free metadata login.
+const SPOTIFY_SIGN_IN_POLL_SECS: u64 = 2;
+const SPOTIFY_SIGN_IN_TIMEOUT_SECS: u64 = 5 * 60;
 
 /// Resets [`SC_SIGNING_IN`] whenever the capture flow ends — success, failure or panic.
 struct SoundcloudSignInGuard;
 impl Drop for SoundcloudSignInGuard {
     fn drop(&mut self) {
         SC_SIGNING_IN.store(false, Ordering::SeqCst);
+    }
+}
+
+async fn spotify_web_sign_in(st: &Arc<AppState>) -> anyhow::Result<()> {
+    // Reuse a browser session that is already signed in, without opening another tab.
+    if let Some(cookie) =
+        tokio::task::spawn_blocking(crate::browser_auth::import_spotify_cookie).await.ok().flatten()
+    {
+        if st.spotify.sign_in_web_session(cookie).await.is_ok() {
+            return Ok(());
+        }
+    }
+
+    if !crate::browser_auth::open_spotify_in_default_browser() {
+        anyhow::bail!("Could not open your default browser for Spotify sign-in.");
+    }
+    st.emit("spotify-auth", json!({ "state": "waiting" }));
+
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(SPOTIFY_SIGN_IN_TIMEOUT_SECS);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "Spotify sign-in timed out. Finish signing in in your browser and try again."
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(SPOTIFY_SIGN_IN_POLL_SECS)).await;
+        if !st.spotify.is_metadata_only() {
+            anyhow::bail!("Spotify metadata-only sign-in was cancelled because the mode changed.");
+        }
+        let Some(cookie) = tokio::task::spawn_blocking(crate::browser_auth::import_spotify_cookie)
+            .await
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        // An old/expired browser cookie can be present before sign-in. Keep watching for the
+        // browser to replace it rather than ending the flow on the first failed exchange.
+        if st.spotify.sign_in_web_session(cookie).await.is_ok() {
+            return Ok(());
+        }
     }
 }
 
@@ -188,20 +286,48 @@ impl Dispatch for Methods {
                 ok(ryotunes_core::update::install_update(version).await.map_err(err)?)
             }
             "subscribe" => {
+                let snapshot_started = Instant::now();
                 conn.subscribe();
                 let provider = st.spotify.selected().as_str();
-                let spotify = spotify_status_json(st).await;
+                let stage_started = Instant::now();
+                let spotify = spotify_snapshot_json(st).await;
+                log_snapshot_stage("spotify", stage_started.elapsed());
+                let stage_started = Instant::now();
+                let playback = st.playback_snapshot().await;
+                log_snapshot_stage("playback", stage_started.elapsed());
+                let stage_started = Instant::now();
+                let queue = st.queue_snapshot().await;
+                log_snapshot_stage("queue", stage_started.elapsed());
+                let stage_started = Instant::now();
+                let settings = st.settings_snapshot();
+                log_snapshot_stage("settings", stage_started.elapsed());
+                let stage_started = Instant::now();
+                let auth = st.account_snapshot();
+                log_snapshot_stage("account", stage_started.elapsed());
+                let stage_started = Instant::now();
+                let audio_fx = st.audio_fx();
+                log_snapshot_stage("audio_fx", stage_started.elapsed());
+                let stage_started = Instant::now();
+                let soundcloud = soundcloud_status_json(st);
+                log_snapshot_stage("soundcloud", stage_started.elapsed());
+                let stage_started = Instant::now();
+                let tidal = tidal_status_json(st);
+                log_snapshot_stage("tidal", stage_started.elapsed());
+                let stage_started = Instant::now();
+                let downloads = self.downloads.snapshot();
+                log_snapshot_stage("downloads", stage_started.elapsed());
+                log_snapshot_stage("total", snapshot_started.elapsed());
                 ok(json!({
-                    "playback": st.playback_snapshot().await,
-                    "queue": st.queue_snapshot().await,
-                    "settings": st.settings_snapshot(),
-                    "auth": st.account_snapshot(),
-                    "audioFx": st.audio_fx(),
+                    "playback": playback,
+                    "queue": queue,
+                    "settings": settings,
+                    "auth": auth,
+                    "audioFx": audio_fx,
                     "provider": provider,
                     "spotify": spotify,
-                    "soundcloud": soundcloud_status_json(st),
-                    "tidal": tidal_status_json(st),
-                    "downloads": self.downloads.snapshot(),
+                    "soundcloud": soundcloud,
+                    "tidal": tidal,
+                    "downloads": downloads,
                 }))
             }
             "quit" => {
@@ -288,9 +414,14 @@ impl Dispatch for Methods {
             }
             "prefetch_stream" => {
                 let st2 = st.clone();
-                let video_id = arg::<String>(&params, "videoId")?;
-                let is_upload = arg::<Option<bool>>(&params, "isUpload")?.unwrap_or(false);
-                tokio::spawn(async move { st2.prefetch_stream(video_id, is_upload).await });
+                if params.get("item").is_some() {
+                    let item = arg::<SongItem>(&params, "item")?;
+                    tokio::spawn(async move { st2.prefetch_song(item).await });
+                } else {
+                    let video_id = arg::<String>(&params, "videoId")?;
+                    let is_upload = arg::<Option<bool>>(&params, "isUpload")?.unwrap_or(false);
+                    tokio::spawn(async move { st2.prefetch_stream(video_id, is_upload).await });
+                }
                 null()
             }
             "play_index" => {
@@ -382,7 +513,7 @@ impl Dispatch for Methods {
             // --- settings --------------------------------------------------------------------
             "get_settings" => ok(st.settings_snapshot()),
             "discord_status" => ok(st.discord_status()),
-            "set_setting" => set_setting(st, &params),
+            "set_setting" => set_setting(st, &params).await,
             "get_personal" => ok(json!({ "personal": st.personal() })),
             "set_personal" => {
                 st.set_personal(arg::<Value>(&params, "personal")?).map_err(err)?;
@@ -465,24 +596,35 @@ impl Dispatch for Methods {
                     }
                     return ok(json!({ "started": true }));
                 }
+                // A new sign-in can select a different account. Do not surface the previous
+                // account's cached display name while the browser flow is in progress.
+                st.db.delete_setting(SPOTIFY_DISPLAY_NAME_KEY);
                 let task = st.clone();
                 tokio::spawn(async move {
                     let _guard = SignInGuard;
                     let emitter = task.clone();
-                    let result = task
-                        .spotify
-                        .sign_in(move |url| {
-                            *SPOTIFY_AUTH_URL.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(url.clone());
-                            emitter.emit("spotify-auth", json!({ "state": "url", "url": url }));
-                        })
-                        .await;
+                    let result = if task.spotify.is_metadata_only() {
+                        spotify_web_sign_in(&task).await
+                    } else {
+                        task.spotify
+                            .sign_in(move |url| {
+                                *SPOTIFY_AUTH_URL.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(url.clone());
+                                emitter.emit("spotify-auth", json!({ "state": "url", "url": url }));
+                            })
+                            .await
+                    };
                     match result {
                         Ok(()) => {
                             let name = spotify_name(&task).await;
                             task.emit(
                                 "spotify-auth",
-                                json!({ "state": "signed_in", "name": name }),
+                                json!({
+                                    "state": "signed_in",
+                                    "name": name,
+                                    "metadataOnly": task.spotify.is_metadata_only(),
+                                    "premium": !task.spotify.is_metadata_only(),
+                                }),
                             );
                         }
                         Err(e) => {
@@ -500,6 +642,7 @@ impl Dispatch for Methods {
             }
             "spotify_sign_out" => {
                 st.spotify.sign_out().await;
+                st.db.delete_setting(SPOTIFY_DISPLAY_NAME_KEY);
                 st.emit("spotify-auth", json!({ "state": "signed_out" }));
                 ok(json!({ "signedIn": false }))
             }
@@ -555,7 +698,14 @@ impl Dispatch for Methods {
             }
             "get_playlist" => get_playlist(st, &params).await,
             "get_playlist_more" => {
-                ok(st.playlist_more(&arg::<String>(&params, "token")?).await.map_err(err)?)
+                let token = arg::<String>(&params, "token")?;
+                if parse_spotify_liked_token(&token).is_some() {
+                    spotify_liked_more(st, &token).await
+                } else if parse_spotify_playlist_continuation(&token).is_some() {
+                    spotify_playlist_more(st, &token).await
+                } else {
+                    ok(st.playlist_more(&token).await.map_err(err)?)
+                }
             }
             "playlist_index" => ok(st.db.playlist_memberships()),
             "sync_playlist_index" => sync_playlist_index(st).await,
@@ -672,6 +822,7 @@ impl Dispatch for Methods {
                         .set_track_saved(tid, matches!(rating, Rating::Like))
                         .await
                         .map_err(spotify_err)?;
+                    st.emit("liked-songs-changed", json!({}));
                     return null();
                 }
                 // No YouTube rating to set (a guest, a SoundCloud or local track): the heart
@@ -713,6 +864,7 @@ impl Dispatch for Methods {
                         .ok_or_else(|| spotify_err("Not a Spotify track."))?;
                     if pid == "liked" {
                         client.set_track_saved(tid, true).await.map_err(spotify_err)?;
+                        st.emit("liked-songs-changed", json!({}));
                     } else {
                         client.add_track_to_playlist(pid, tid).await.map_err(spotify_err)?;
                     }
@@ -756,6 +908,7 @@ impl Dispatch for Methods {
                         .ok_or_else(|| spotify_err("Not a Spotify track."))?;
                     if pid == "liked" {
                         client.set_track_saved(tid, false).await.map_err(spotify_err)?;
+                        st.emit("liked-songs-changed", json!({}));
                     } else {
                         client.remove_track_from_playlist(pid, tid).await.map_err(spotify_err)?;
                     }
@@ -1189,30 +1342,89 @@ impl Dispatch for Methods {
 
 // --- Spotify command bodies -------------------------------------------------------------------
 
-/// The `{signedIn, stored, name, premium}` block for `spotify_status` and the subscribe snapshot.
-/// A signed-in session implies Premium (the crate gates both sign-in and restore on it).
+/// The Spotify account block for `spotify_status` and the subscribe snapshot.
 async fn spotify_status_json(st: &Arc<AppState>) -> Value {
     let signed_in = st.spotify.status().await;
-    let name = if signed_in { spotify_name(st).await } else { None };
-    let premium = signed_in.then_some(true);
+    let name = if signed_in {
+        match st.db.get_setting(SPOTIFY_DISPLAY_NAME_KEY).filter(|name| !name.trim().is_empty()) {
+            Some(name) => Some(name),
+            None => spotify_name(st).await,
+        }
+    } else {
+        None
+    };
+    let metadata_only = st.spotify.is_metadata_only();
+    let premium = signed_in.then_some(!metadata_only);
     json!({
         "signedIn": signed_in,
         "stored": st.spotify.stored(),
         "name": name,
         "premium": premium,
+        "metadataOnly": metadata_only,
+    })
+}
+
+/// The opening snapshot must not wait for Spotify's background credential restore or profile
+/// request. A `spotify-auth` restore event updates the mirror as soon as that work completes.
+async fn spotify_snapshot_json(st: &Arc<AppState>) -> Value {
+    let signed_in = st.spotify.cached_status().await;
+    let name = if signed_in {
+        st.db.get_setting(SPOTIFY_DISPLAY_NAME_KEY).filter(|name| !name.trim().is_empty())
+    } else {
+        None
+    };
+    let metadata_only = st.spotify.is_metadata_only();
+    let premium = signed_in.then_some(!metadata_only);
+    json!({
+        "signedIn": signed_in,
+        "stored": st.spotify.stored(),
+        "name": name,
+        "premium": premium,
+        "metadataOnly": metadata_only,
     })
 }
 
 /// The signed-in profile's display name, fetched fresh. `None` when signed out or unreachable.
 async fn spotify_name(st: &Arc<AppState>) -> Option<String> {
     let client = st.spotify.client().await?;
-    client.profile().await.ok().map(|profile| profile.display_name)
+    let name = client.profile().await.ok()?.display_name;
+    if !name.trim().is_empty() {
+        st.db.set_setting(SPOTIFY_DISPLAY_NAME_KEY, &name);
+    }
+    Some(name)
 }
 
 async fn spotify_search_all(st: &Arc<AppState>, query: &str) -> Result<Value, ErrorBody> {
     let client = st.spotify.client().await.ok_or_else(spotify_signed_out)?;
     let results = client.search(query).await.map_err(spotify_err)?;
-    ok(spotify_bridge::search_all(&results))
+    let mut payload = serde_json::to_value(spotify_bridge::search_all(&results)).map_err(err)?;
+    enrich_search_song_albums(
+        &mut payload,
+        results.tracks.iter().map(|track| {
+            (
+                (!track.album.is_empty()).then(|| track.album.clone()),
+                track.album_id.as_ref().map(|id| format!("spotify:album:{id}")),
+            )
+        }),
+    );
+    ok(payload)
+}
+
+fn enrich_search_song_albums(
+    payload: &mut Value,
+    albums: impl IntoIterator<Item = (Option<String>, Option<String>)>,
+) {
+    let Some(songs) = payload.get_mut("songs").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for (song, (album, album_id)) in songs.iter_mut().zip(albums) {
+        if let Some(album) = album {
+            song["album"] = Value::String(album);
+        }
+        if let Some(album_id) = album_id {
+            song["albumId"] = Value::String(album_id);
+        }
+    }
 }
 
 async fn spotify_search_page(st: &Arc<AppState>, query: &str) -> Result<Value, ErrorBody> {
@@ -1251,7 +1463,7 @@ async fn spotify_library_artists(st: &Arc<AppState>) -> Result<Value, ErrorBody>
     ok(artists.iter().map(spotify_bridge::saved_artist_to_card).collect::<Vec<_>>())
 }
 
-/// `spotify:playlist:liked` pages every saved track; any other id is a real Spotify playlist.
+/// Spotify saved tracks return the first page immediately; the rest load as the user scrolls.
 async fn spotify_playlist(
     st: &Arc<AppState>,
     pid: &str,
@@ -1260,22 +1472,73 @@ async fn spotify_playlist(
 ) -> Result<Value, ErrorBody> {
     let client = st.spotify.client().await.ok_or_else(spotify_signed_out)?;
     if pid == "liked" {
-        let mut tracks = Vec::new();
-        let mut page = 0u32;
-        loop {
-            let batch = client.liked(page).await.map_err(spotify_err)?;
-            let full = batch.len() >= SPOTIFY_LIKED_PAGE;
-            tracks.extend(batch);
-            if !full {
-                break;
+        let selected_sort = sort.unwrap_or(PlaylistSort::Newest);
+        if !spotify_liked_can_page(st.spotify.is_metadata_only(), sort, desc) {
+            let mut tracks = Vec::new();
+            let mut page = 0u32;
+            loop {
+                let batch = client.liked(page).await.map_err(spotify_err)?;
+                let full = batch.len() >= SPOTIFY_LIKED_PAGE;
+                tracks.extend(batch);
+                if !full {
+                    break;
+                }
+                page += 1;
             }
-            page += 1;
+            return ok(spotify_bridge::liked_page(&tracks, Some(selected_sort), desc));
         }
-        ok(spotify_bridge::liked_page(&tracks, sort, desc))
+
+        let tracks = client.liked(0).await.map_err(spotify_err)?;
+        let mut page = ok(spotify_bridge::liked_page(&tracks, Some(selected_sort), desc))?;
+        page["continuation"] = if tracks.len() >= SPOTIFY_LIKED_PAGE {
+            json!(spotify_liked_token(1, selected_sort, desc))
+        } else {
+            Value::Null
+        };
+        Ok(page)
     } else {
-        let detail = client.playlist(pid).await.map_err(spotify_err)?;
-        ok(spotify_bridge::playlist_page(&detail, sort, desc))
+        if spotify_playlist_can_page(st.spotify.is_metadata_only(), sort, desc) {
+            let detail = client.playlist_page(pid, 0).await.map_err(spotify_err)?;
+            let mut page = ok(spotify_bridge::playlist_page(&detail, sort, desc))?;
+            page["continuation"] = if detail.tracks.len() >= SPOTIFY_PLAYLIST_PAGE {
+                json!(spotify_playlist_continuation(pid, 1))
+            } else {
+                Value::Null
+            };
+            Ok(page)
+        } else {
+            let detail = client.playlist(pid).await.map_err(spotify_err)?;
+            ok(spotify_bridge::playlist_page(&detail, sort, desc))
+        }
     }
+}
+
+async fn spotify_playlist_more(st: &Arc<AppState>, token: &str) -> Result<Value, ErrorBody> {
+    let (playlist_id, page_num) = parse_spotify_playlist_continuation(token)
+        .ok_or_else(|| err("That Spotify playlist page token is invalid."))?;
+    let client = st.spotify.client().await.ok_or_else(spotify_signed_out)?;
+    let detail = client.playlist_page(playlist_id, page_num).await.map_err(spotify_err)?;
+    let continuation = (detail.tracks.len() >= SPOTIFY_PLAYLIST_PAGE)
+        .then(|| spotify_playlist_continuation(playlist_id, page_num.saturating_add(1)));
+    let page = ok(spotify_bridge::playlist_page(&detail, None, false))?;
+    Ok(json!({
+        "items": page.get("items").cloned().unwrap_or_else(|| json!([])),
+        "continuation": continuation,
+    }))
+}
+
+async fn spotify_liked_more(st: &Arc<AppState>, token: &str) -> Result<Value, ErrorBody> {
+    let (page, sort, desc) = parse_spotify_liked_token(token)
+        .ok_or_else(|| err("That Spotify liked-songs page token is invalid."))?;
+    let client = st.spotify.client().await.ok_or_else(spotify_signed_out)?;
+    let tracks = client.liked(page).await.map_err(spotify_err)?;
+    let continuation = (tracks.len() >= SPOTIFY_LIKED_PAGE)
+        .then(|| spotify_liked_token(page.saturating_add(1), sort, desc));
+    let page = ok(spotify_bridge::liked_page(&tracks, Some(sort), desc))?;
+    Ok(json!({
+        "items": page.get("items").cloned().unwrap_or_else(|| json!([])),
+        "continuation": continuation,
+    }))
 }
 
 async fn spotify_album(st: &Arc<AppState>, id: &str) -> Result<Value, ErrorBody> {
@@ -1327,7 +1590,11 @@ async fn spotify_edit_playlist(
 /// page: its shelves are simply absent, and so is a dead YouTube spine — offline, the merged
 /// home still shows what the signed-in providers hold.
 async fn home_merged(st: &Arc<AppState>) -> Result<Value, ErrorBody> {
-    let mut spine = st.home(None).await.unwrap_or(innertube::HomePage {
+    // These providers do not depend on one another. Fetch their rows together so a slow
+    // secondary catalogue does not add its full network latency after the YouTube spine.
+    let (spine, soundcloud, spotify) =
+        tokio::join!(st.home(None), soundcloud_home_sections(st), spotify_home_sections(st),);
+    let mut spine = spine.unwrap_or(innertube::HomePage {
         chips: Vec::new(),
         sections: Vec::new(),
         continuation: None,
@@ -1335,17 +1602,15 @@ async fn home_merged(st: &Arc<AppState>) -> Result<Value, ErrorBody> {
     let mut extra: Vec<innertube::Section> = Vec::new();
 
     // SoundCloud: personal shelves first when signed in, then the discover rows everyone gets.
-    if let Some(mut sc) = soundcloud_home_sections(st).await {
+    if let Some(mut sc) = soundcloud {
         extra.append(&mut sc);
     }
 
     // Spotify: whenever a Premium session exists — the merged home aggregates every
     // signed-in provider, regardless of which catalogue the selector points at for
     // Library/Search. A session that died since startup recovers once from the cache.
-    if let Some(client) = st.spotify.client().await {
-        if let Ok(feed) = client.home().await {
-            extra.extend(spotify_bridge::home_page(&feed).sections);
-        }
+    if let Some(mut spotify) = spotify {
+        extra.append(&mut spotify);
     }
 
     if !extra.is_empty() {
@@ -1358,17 +1623,25 @@ async fn home_merged(st: &Arc<AppState>) -> Result<Value, ErrorBody> {
     ok(spine)
 }
 
+async fn spotify_home_sections(st: &Arc<AppState>) -> Option<Vec<innertube::Section>> {
+    let client = st.spotify.client().await?;
+    let feed = client.home().await.ok()?;
+    Some(spotify_bridge::home_page(&feed).sections)
+}
+
 /// SoundCloud's contribution to the merged home: the signed-in account's own rows first
 /// (playlists / likes / following), then the public discover shelves. A dead token clears
 /// itself so the personal rows stop demanding re-auth on every open.
 async fn soundcloud_home_sections(st: &Arc<AppState>) -> Option<Vec<innertube::Section>> {
     let mut sections = Vec::new();
-    if st.soundcloud.signed_in() {
-        match (
-            st.soundcloud.my_playlists().await,
-            st.soundcloud.my_likes().await,
-            st.soundcloud.my_followings().await,
-        ) {
+    let discover = if st.soundcloud.signed_in() {
+        let (playlists, likes, followings, discover) = tokio::join!(
+            st.soundcloud.my_playlists(),
+            st.soundcloud.my_likes(),
+            st.soundcloud.my_followings(),
+            st.soundcloud.discover(),
+        );
+        match (playlists, likes, followings) {
             (Ok(playlists), Ok(likes), Ok(followings)) => {
                 sections = soundcloud_bridge::personal_home(&playlists, &likes, &followings);
             }
@@ -1380,7 +1653,6 @@ async fn soundcloud_home_sections(st: &Arc<AppState>) -> Option<Vec<innertube::S
                 let is_dead = |e: &ryotunes_soundcloud::Error| {
                     matches!(e, ryotunes_soundcloud::Error::Api { status: 401 | 403, .. })
                 };
-                // The three calls differ in payload type, so test their errors one by one.
                 let dead = a.as_ref().err().is_some_and(is_dead)
                     || b.as_ref().err().is_some_and(is_dead)
                     || c.as_ref().err().is_some_and(is_dead);
@@ -1398,8 +1670,11 @@ async fn soundcloud_home_sections(st: &Arc<AppState>) -> Option<Vec<innertube::S
                 }
             }
         }
-    }
-    match st.soundcloud.discover().await {
+        discover
+    } else {
+        st.soundcloud.discover().await
+    };
+    match discover {
         Ok(selections) => {
             sections.extend(soundcloud_bridge::discover_home(&selections).sections);
             Some(sections)
@@ -1452,13 +1727,14 @@ async fn soundcloud_system_playlist(
 /// likes, fetched concurrently. A missing sub-list degrades to empty rather than failing the page.
 async fn soundcloud_artist(st: &Arc<AppState>, id: u64) -> Result<Value, ErrorBody> {
     let sc = &st.soundcloud;
-    let user = sc.user(id).await.map_err(soundcloud_err)?;
-    let (tracks, albums, playlists, likes) = tokio::join!(
+    let (user, tracks, albums, playlists, likes) = tokio::join!(
+        sc.user(id),
         sc.user_tracks(id, 0),
         sc.user_albums(id),
         sc.user_playlists(id),
         sc.user_likes(id),
     );
+    let user = user.map_err(soundcloud_err)?;
     let tracks = tracks.map(|page| page.items).unwrap_or_default();
     let page = soundcloud_bridge::artist_page(
         &user,
@@ -1479,7 +1755,7 @@ async fn soundcloud_waveform(st: &Arc<AppState>, id: u64) -> Result<Value, Error
 
 // --- ported command bodies that are too large for a match arm ---------------------------------
 
-fn set_setting(st: &Arc<AppState>, params: &Value) -> Result<Value, ErrorBody> {
+async fn set_setting(st: &Arc<AppState>, params: &Value) -> Result<Value, ErrorBody> {
     let key = arg::<String>(params, "key")?;
     let value = arg::<String>(params, "value")?;
     if !UI_SETTINGS.contains(&key.as_str()) {
@@ -1511,9 +1787,12 @@ fn set_setting(st: &Arc<AppState>, params: &Value) -> Result<Value, ErrorBody> {
     }
     if key == "spotify_metadata_only" {
         let metadata_only = value == "true";
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(st.spotify.set_metadata_only(metadata_only))
-        });
+        let changed = st.spotify.is_metadata_only() != metadata_only;
+        st.spotify.set_metadata_only(metadata_only).await;
+        if changed {
+            st.db.delete_setting(SPOTIFY_DISPLAY_NAME_KEY);
+            st.emit("spotify-auth", json!({ "state": "signed_out" }));
+        }
     }
     null()
 }
@@ -2362,6 +2641,59 @@ mod tests {
     }
 
     #[test]
+    fn enrich_search_song_albums_preserves_card_order_and_missing_values() {
+        let mut payload = json!({ "songs": [
+            { "id": "spotify:track:1" },
+            { "id": "spotify:track:2" }
+        ] });
+        enrich_search_song_albums(
+            &mut payload,
+            [(Some("First Album".to_string()), Some("spotify:album:a".to_string())), (None, None)],
+        );
+        assert_eq!(payload["songs"][0]["album"], "First Album");
+        assert_eq!(payload["songs"][0]["albumId"], "spotify:album:a");
+        assert!(payload["songs"][1].get("album").is_none());
+        assert!(payload["songs"][1].get("albumId").is_none());
+    }
+
+    #[test]
+    fn spotify_liked_page_tokens_round_trip_and_reject_malformed_values() {
+        for sort in [
+            PlaylistSort::Default,
+            PlaylistSort::Newest,
+            PlaylistSort::Oldest,
+            PlaylistSort::Title,
+            PlaylistSort::Artist,
+            PlaylistSort::Album,
+            PlaylistSort::Top,
+        ] {
+            let token = spotify_liked_token(7, sort, true);
+            assert_eq!(parse_spotify_liked_token(&token), Some((7, sort, true)));
+        }
+        assert_eq!(parse_spotify_liked_token("spotify:playlist:liked"), None);
+        assert_eq!(parse_spotify_liked_token("ryotunes:spotify-liked:v1:bad:title:0"), None);
+        assert_eq!(parse_spotify_liked_token("ryotunes:spotify-liked:v1:1:newest:2"), None);
+    }
+
+    #[test]
+    fn spotify_liked_only_pages_metadata_mode_in_default_order() {
+        assert!(spotify_liked_can_page(true, None, false));
+        assert!(spotify_liked_can_page(true, Some(PlaylistSort::Newest), false));
+        assert!(!spotify_liked_can_page(true, Some(PlaylistSort::Title), false));
+        assert!(!spotify_liked_can_page(true, Some(PlaylistSort::Newest), true));
+        assert!(!spotify_liked_can_page(false, None, false));
+    }
+
+    #[test]
+    fn spotify_playlists_only_page_metadata_mode_in_default_order() {
+        assert!(spotify_playlist_can_page(true, None, false));
+        assert!(spotify_playlist_can_page(true, Some(PlaylistSort::Default), false));
+        assert!(!spotify_playlist_can_page(true, Some(PlaylistSort::Newest), false));
+        assert!(!spotify_playlist_can_page(true, None, true));
+        assert!(!spotify_playlist_can_page(false, None, false));
+    }
+
+    #[test]
     fn proxy_setting_is_validated() {
         assert!(normalize_proxy_setting("http://127.0.0.1:8080").is_ok());
         assert!(normalize_proxy_setting("file:///tmp/socket").is_err());
@@ -2398,7 +2730,7 @@ mod tests {
         // Valid values
         assert_eq!(normalize_ui_setting("spotify_metadata_only", "true").unwrap(), "true");
         assert_eq!(normalize_ui_setting("spotify_metadata_only", "false").unwrap(), "false");
-        
+
         // Invalid values
         assert!(normalize_ui_setting("spotify_metadata_only", "yes").is_err());
         assert!(normalize_ui_setting("spotify_metadata_only", "1").is_err());
@@ -2446,7 +2778,17 @@ fn tidal_status_json(st: &Arc<AppState>) -> Value {
 
 async fn tidal_search_all(st: &Arc<AppState>, query: &str) -> Result<Value, ErrorBody> {
     let results = st.tidal.search(query, 40).await.map_err(tidal_err)?;
-    ok(tidal_bridge::search_all(&results))
+    let mut payload = serde_json::to_value(tidal_bridge::search_all(&results)).map_err(err)?;
+    enrich_search_song_albums(
+        &mut payload,
+        results.tracks.items.iter().map(|track| {
+            (
+                track.album.as_ref().map(|album| album.title.clone()),
+                track.album.as_ref().map(|album| format!("tidal:album:{}", album.id)),
+            )
+        }),
+    );
+    ok(payload)
 }
 
 async fn tidal_search_page(st: &Arc<AppState>, query: &str) -> Result<Value, ErrorBody> {
@@ -2464,15 +2806,21 @@ async fn tidal_search_cards(
 }
 
 async fn tidal_album(st: &Arc<AppState>, id: u64) -> Result<Value, ErrorBody> {
-    let album = st.tidal.album(id).await.map_err(tidal_err)?;
-    let tracks = st.tidal.album_tracks(id, 100).await.map_err(tidal_err)?;
+    let (album, tracks) = tokio::join!(st.tidal.album(id), st.tidal.album_tracks(id, 100));
+    let album = album.map_err(tidal_err)?;
+    let tracks = tracks.map_err(tidal_err)?;
     ok(tidal_bridge::album_page(&album, &tracks.items))
 }
 
 async fn tidal_artist(st: &Arc<AppState>, id: u64) -> Result<Value, ErrorBody> {
-    let artist = st.tidal.artist(id).await.map_err(tidal_err)?;
-    let top = st.tidal.artist_top_tracks(id, 10).await.map_err(tidal_err)?;
-    let albums = st.tidal.artist_albums(id, 20).await.map_err(tidal_err)?;
+    let (artist, top, albums) = tokio::join!(
+        st.tidal.artist(id),
+        st.tidal.artist_top_tracks(id, 10),
+        st.tidal.artist_albums(id, 20),
+    );
+    let artist = artist.map_err(tidal_err)?;
+    let top = top.map_err(tidal_err)?;
+    let albums = albums.map_err(tidal_err)?;
     ok(tidal_bridge::artist_page(&artist, &top.items, &albums.items))
 }
 
@@ -2488,9 +2836,11 @@ async fn tidal_home(st: &Arc<AppState>) -> Result<Value, ErrorBody> {
     if !st.tidal.signed_in() {
         return ok(json!({ "chips": [], "sections": [], "continuation": null }));
     }
-    let playlists = st.tidal.my_playlists(20).await.map_err(tidal_err)?;
-    let tracks = st.tidal.my_tracks(20).await.map_err(tidal_err)?;
-    let albums = st.tidal.my_albums(20).await.map_err(tidal_err)?;
+    let (playlists, tracks, albums) =
+        tokio::join!(st.tidal.my_playlists(20), st.tidal.my_tracks(20), st.tidal.my_albums(20),);
+    let playlists = playlists.map_err(tidal_err)?;
+    let tracks = tracks.map_err(tidal_err)?;
+    let albums = albums.map_err(tidal_err)?;
     let tracks: Vec<_> = tracks.items.into_iter().map(|f| f.item).collect();
     let albums: Vec<_> = albums.items.into_iter().map(|f| f.item).collect();
     let sections = tidal_bridge::library_sections(&tracks, &albums, &playlists.items);

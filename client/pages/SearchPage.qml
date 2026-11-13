@@ -6,13 +6,15 @@ import "../"
 import "../components"
 import "../chrome"
 import "../lib/browse.js" as Browse
+import "../lib/detail-cache.js" as DetailCache
 import "../lib/ids.js" as Ids
+import "../lib/search.js" as Search
 
 // The search page, ported from ui/src/routes/search/+page.svelte. The field runs one mixed page
-// (search_all) plus one songs page (search_page) in parallel, then lays the result out as the same
-// categorised sections the Svelte page has — Top (4), Songs (6), Albums (5), Artists (3), Playlists
-// (5) — each with a "Show more" that expands that category in place (search_cards / search_page_more,
-// the folded-in search-more route). The SearchSuggest typeahead handles quick keyboard navigation.
+// (search_all), whose categorized song rows and continuation also supply the song list. Results
+// use the same sections — Top (4), Songs (6), Albums (5),
+// Artists (3), Playlists (5) — and "Show more" reuses mixed rows or fetches a continuation as needed.
+// The SearchSuggest typeahead handles quick keyboard navigation.
 Item {
     id: page
 
@@ -61,10 +63,7 @@ Item {
         }
     }
 
-    readonly property var songRows: {
-        var s = page.songs.length ? page.songs : ((page.res && page.res.songs) ? page.res.songs.map(Browse.asSong) : []);
-        return s.filter((song) => !song.is_video);
-    }
+    readonly property var songRows: Browse.searchSongRows(page.songs, page.res ? page.res.songs : [])
     readonly property var sections: {
         if (!page.res)
             return [];
@@ -107,14 +106,12 @@ Item {
         if (!page.res || page.searched !== q)
             page.searching = true;
         page.errorMsg = "";
-        Promise.all([
-            Daemon.call("search_all", { query: q }),
-            Daemon.call("search_page", { query: q }).catch(() => ({ items: [] }))
-        ]).then((r) => {
-            if (page.latest !== q)
+        var provider = Playback.provider;
+        Search.loadResults(provider, q, () => Daemon.call("search_all", { query: q })).then((r) => {
+            if (page.latest !== q || Playback.provider !== provider)
                 return;
-            page.res = r[0];
-            page.songs = r[1].items || [];
+            page.res = r;
+            page.songs = [];
             page.searched = q;
             page.searching = false;
             // Land the results list at the top: a ListView with a tall header (the Top-result card)
@@ -153,11 +150,11 @@ Item {
         if (item.kind === "song") {
             page.playSong(Browse.asSong(item));
         } else if (item.kind === "album") {
-            Daemon.call("get_album", { id: item.id })
+            DetailCache.get("get_album", { id: item.id }, () => Daemon.call("get_album", { id: item.id }))
                 .then((a) => Daemon.call("play_playlist", { items: a.items, sourceId: a.playlistId, sourceName: item.title }))
                 .catch(() => Playback.toast("Could not play — try opening it", "error"));
         } else if (item.kind === "playlist") {
-            Daemon.call("get_playlist", { id: item.id })
+            DetailCache.get("get_playlist", { id: item.id }, () => Daemon.call("get_playlist", { id: item.id }))
                 .then((p) => Daemon.call("play_playlist", {
                     items: p.items,
                     sourceId: Ids.isSmartPlaylistId(item.id) ? undefined : item.id,
@@ -176,23 +173,28 @@ Item {
         page.expandedCont = "";
         page.expandedLoading = true;
         if (sec.key === "songs") {
-            Daemon.call("search_page", { query: page.searched })
-                .then((r) => { page.expandedItems = (r.items || []).filter((s) => !s.is_video); page.expandedCont = r.continuation || ""; page.expandedLoading = false; })
-                .catch(() => page.expandedLoading = false);
-        } else {
-            Daemon.call("search_cards", { query: page.searched, category: sec.key })
-                .then((items) => { page.expandedItems = items || []; page.expandedLoading = false; })
-                .catch(() => page.expandedLoading = false);
+            page.expandedItems = Browse.searchSongRows([], page.res.songs || []);
+            page.expandedCont = page.res.continuation || "";
+            page.expandedLoading = false;
+            return;
         }
+        if (Browse.hasCompleteMixedSearch(Playback.provider)) {
+            page.expandedItems = Browse.expandedMixedSearchRows(page.res, sec.key, page.songs);
+            page.expandedLoading = false;
+            return;
+        }
+        Daemon.call("search_cards", { query: page.searched, category: sec.key })
+            .then((items) => { page.expandedItems = items || []; page.expandedLoading = false; })
+            .catch(() => page.expandedLoading = false);
     }
     function loadMoreExpanded() {
         if (page.expandedCat !== "songs" || !page.expandedCont || page.expandedLoading)
             return;
         page.expandedLoading = true;
         var token = page.expandedCont;
-        Daemon.call("search_page_more", { token: token })
+        Daemon.call("search_all_more", { token: token })
             .then((r) => {
-                page.expandedItems = page.expandedItems.concat((r.items || []).filter((s) => !s.is_video));
+                page.expandedItems = page.expandedItems.concat(Browse.searchSongRows([], r.songs || []));
                 page.expandedCont = r.continuation || "";
                 page.expandedLoading = false;
             })

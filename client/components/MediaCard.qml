@@ -5,6 +5,8 @@ import Ryoku.Ui.Singletons
 import "../"
 import "../lib/ids.js" as Ids
 import "../lib/browse.js" as Browse
+import "../lib/detail-cache.js" as DetailCache
+import "../lib/liked-cache.js" as LikedCache
 
 // A shelf / grid card (spec section 4): 168 px square artwork (a circle for an artist) at
 // radiusCard, a title in md and a subtitle in sm. Hover lifts the whole card two pixels and rings
@@ -20,6 +22,22 @@ Item {
 
     width: cardWidth
     implicitHeight: col.implicitHeight
+
+    function scheduleDetailPrefetch() {
+        detailPrefetchTimer.stop();
+        if (!cardHover.hovered)
+            return;
+        if (root.item && root.item.id === "spotify:playlist:liked"
+                && Playback.provider === "spotify" && Playback.spotify && Playback.spotify.metadataOnly) {
+            detailPrefetchTimer.start();
+            return;
+        }
+        if (DetailCache.metadataDetailMethod(root.item, Playback.provider,
+                !!(Playback.spotify && Playback.spotify.metadataOnly)))
+            detailPrefetchTimer.start();
+    }
+
+    onItemChanged: root.scheduleDetailPrefetch()
 
     // active hover lift (transform, so it never disturbs layout)
     transform: Translate {
@@ -45,11 +63,11 @@ Item {
             return;
         }
         if (it.kind === "album") {
-            Daemon.call("get_album", { id: it.id })
+            DetailCache.get("get_album", { id: it.id }, () => Daemon.call("get_album", { id: it.id }))
                 .then((a) => Daemon.call("play_playlist", { items: a.items, sourceId: a.playlistId, sourceName: it.title, shuffle: false }))
                 .catch(() => Playback.toast("Could not play — try opening it", "error"));
         } else {
-            Daemon.call("get_playlist", { id: it.id })
+            DetailCache.get("get_playlist", { id: it.id }, () => Daemon.call("get_playlist", { id: it.id }))
                 .then((p) => Daemon.call("play_playlist", {
                     items: p.items,
                     sourceId: Ids.isSmartPlaylistId(it.id) ? undefined : it.id,
@@ -166,5 +184,24 @@ Item {
         }
     }
 
-    HoverHandler { id: cardHover }
+    HoverHandler {
+        id: cardHover
+        onHoveredChanged: root.scheduleDetailPrefetch()
+    }
+
+    Timer {
+        id: detailPrefetchTimer
+        interval: 300
+        repeat: false
+        onTriggered: {
+            if (root.item && root.item.id === "spotify:playlist:liked") {
+                LikedCache.loadFirstPage(() => Daemon.call("get_playlist", { id: root.item.id }))
+                    .catch(() => {});
+                return;
+            }
+            DetailCache.prefetchMetadataDetail(root.item, Playback.provider,
+                !!(Playback.spotify && Playback.spotify.metadataOnly),
+                (method, params) => Daemon.call(method, params)).catch(() => {});
+        }
+    }
 }

@@ -7,9 +7,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::Client;
 use crate::auth::{self, AuthConfig};
 use crate::credentials;
+use crate::{Client, WebApiClient};
 
 /// Provider settings the daemon may override. Defaults are Sonora's public web client id and the
 /// loopback redirect the OAuth listener binds.
@@ -60,13 +60,26 @@ impl SpotifyProvider {
 
     /// Whether a credential file exists to restore from.
     pub fn stored(&self) -> bool {
-        self.auth.file().exists()
+        if self.auth.metadata_only.load(std::sync::atomic::Ordering::Relaxed) {
+            WebApiClient::stored(&self.auth.cache_dir)
+        } else {
+            self.auth.file().exists()
+        }
     }
 
     /// Restore a client from cached credentials. `Ok(None)` when nothing is cached.
     pub async fn restore(&self) -> Result<Option<Client>> {
+        if self.auth.metadata_only.load(std::sync::atomic::Ordering::Relaxed) {
+            return WebApiClient::restore(self.auth.client_id.clone(), &self.auth.cache_dir)
+                .await?
+                .map(Client::new_web_api)
+                .transpose();
+        }
         match auth::restore(&self.auth).await? {
-            Some(session) => Ok(Some(Client::new(session, self.auth.metadata_only.load(std::sync::atomic::Ordering::Relaxed))?)),
+            Some(session) => Ok(Some(Client::new(
+                session,
+                self.auth.metadata_only.load(std::sync::atomic::Ordering::Relaxed),
+            )?)),
             None => Ok(None),
         }
     }
@@ -78,13 +91,39 @@ impl SpotifyProvider {
     where
         F: FnOnce(String) + Send + 'static,
     {
+        if self.auth.metadata_only.load(std::sync::atomic::Ordering::Relaxed) {
+            let tokens = auth::authorize(&self.auth, on_url).await?;
+            return Client::new_web_api(WebApiClient::new(
+                self.auth.client_id.clone(),
+                &self.auth.cache_dir,
+                tokens,
+            )?);
+        }
         let session = auth::sign_in(&self.auth, on_url).await?;
         Client::new(session, self.auth.metadata_only.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Build the metadata client from Spotify's first-party web session. This is only valid when
+    /// metadata-only mode is selected; it never creates a librespot playback session.
+    pub async fn sign_in_web_session(&self, session_cookie: String) -> Result<Client> {
+        anyhow::ensure!(
+            self.auth.metadata_only.load(std::sync::atomic::Ordering::Relaxed),
+            "Spotify web-session sign-in is only available in metadata-only mode"
+        );
+        Client::new_web_api(
+            WebApiClient::from_session_cookie(
+                self.auth.client_id.clone(),
+                &self.auth.cache_dir,
+                session_cookie,
+            )
+            .await?,
+        )
     }
 
     /// Forget the cached credentials.
     pub fn sign_out(&self) {
         auth::forget(&self.auth);
+        WebApiClient::forget(&self.auth.cache_dir);
     }
 }
 
@@ -126,5 +165,34 @@ mod tests {
     fn provider_with_default_config_has_false_metadata_only() {
         let provider = SpotifyProvider::new(PathBuf::from("/tmp/test"));
         assert!(!provider.auth.metadata_only.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn metadata_restore_creates_a_web_api_client_without_a_librespot_session() {
+        let dir =
+            std::env::temp_dir().join(format!("ryotunes-spotify-test-{}", uuid::Uuid::new_v4()));
+        let cache = dir.join("spotify");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(
+            cache.join("web-api-token.json"),
+            serde_json::json!({
+                "access_token": "test-access-token",
+                "refresh_token": null,
+                "session_cookie": "test-session-cookie",
+                "expires_at": u64::MAX,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let provider = SpotifyProvider::with_config(
+            dir.clone(),
+            SpotifyConfig { metadata_only: true, ..SpotifyConfig::default() },
+        );
+
+        let client = provider.restore().await.unwrap().unwrap();
+        assert!(client.is_metadata_only());
+        assert!(client.session().is_none());
+        drop(client);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

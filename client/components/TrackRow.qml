@@ -39,7 +39,11 @@ Rectangle {
     // Seeded from the row's own snapshot; a rating call updates it optimistically. Reset when the
     // delegate is reused for a different song.
     property string rated: (song && song.rating) ? song.rating : "indifferent"
-    onSongChanged: rated = (song && song.rating) ? song.rating : "indifferent"
+    onSongChanged: {
+        rated = (song && song.rating) ? song.rating : "indifferent";
+        root.schedulePrefetch();
+    }
+    onActiveChanged: root.schedulePrefetch()
 
     readonly property bool canRate: !!song && !Ids.isLocalId(song.video_id) && !Ids.isRadioId(song.video_id)
     readonly property string duration: (song && song.duration && /^[\d:]+$/.test(song.duration)) ? song.duration : ""
@@ -60,6 +64,14 @@ Rectangle {
         root.rated = next;
         Daemon.call("rate", { videoId: root.song.video_id, rating: next })
             .catch((e) => Playback.toast((e && e.message) ? e.message : "Could not rate", "error"));
+    }
+
+    function schedulePrefetch() {
+        prefetchTimer.stop();
+        if (rowHover.hovered && !root.active && root.song
+                && (Ids.providerOf(root.song.video_id) === "youtube"
+                    || (Ids.providerOf(root.song.video_id) === "spotify" && Playback.spotify.metadataOnly)))
+            prefetchTimer.start();
     }
 
     MouseArea {
@@ -289,5 +301,14 @@ Rectangle {
         }
     }
 
-    HoverHandler { id: rowHover }
+    Timer {
+        id: prefetchTimer
+        interval: 450
+        repeat: false
+        onTriggered: Playback.prefetchSong(root.song)
+    }
+    HoverHandler {
+        id: rowHover
+        onHoveredChanged: root.schedulePrefetch()
+    }
 }

@@ -5,6 +5,7 @@ import Quickshell.Io
 import Ryoku.Ui.Singletons
 import "../"
 import "../components"
+import "../lib/library.js" as LibraryData
 
 // The library page, ported from ui/src/routes/library/+page.svelte. Account collections load in
 // parallel on open (get_library / _albums / _artists) and fill the card tabs (Albums / Artists /
@@ -18,6 +19,11 @@ Item {
     property var playlists: []
     property var albums: []
     property var artists: []
+    property var loadedCollections: ({})
+    property var loadingCollections: ({})
+    property int collectionEpoch: 0
+    property bool lastSpotifySignedIn: false
+    property bool lastYoutubeSignedIn: false
     property bool loading: true
     property string errorMsg: ""
     property string tab: "songs"
@@ -66,6 +72,8 @@ Item {
     }
 
     Component.onCompleted: {
+        page.lastSpotifySignedIn = !!(Playback.spotify && Playback.spotify.signedIn);
+        page.lastYoutubeSignedIn = !!(Playback.auth && Playback.auth.signedIn);
         var t = (Router.current && Router.current.params && Router.current.params.tab)
             ? Router.current.params.tab : "songs";
         page.selectTab(t);
@@ -75,17 +83,33 @@ Item {
     // A provider switch swaps the whole library: reload (or fall to the sign-in card).
     Connections {
         target: Playback
-        function onProviderChanged(): void { page.load(); }
+        function onProviderChanged(): void {
+            page.clearCollections();
+            page.load();
+        }
+        function onSpotifyChanged(): void {
+            var signedIn = !!(Playback.spotify && Playback.spotify.signedIn);
+            if (signedIn === page.lastSpotifySignedIn)
+                return;
+            page.lastSpotifySignedIn = signedIn;
+            page.clearCollections(true);
+            page.load();
+        }
+        function onAuthChanged(): void {
+            var signedIn = !!(Playback.auth && Playback.auth.signedIn);
+            if (signedIn === page.lastYoutubeSignedIn)
+                return;
+            page.lastYoutubeSignedIn = signedIn;
+            page.clearCollections(true);
+            page.load();
+        }
     }
 
-    // A device-playlist mutation can change a playlist's auto cover: silently re-read the playlist
-    // collection (only playlists carry auto collages; albums/artists have provider art) so the cards
-    // follow without the loading overlay flashing over the grid.
     Connections {
-        target: Daemon
-        function onEvent(name: string, data: var): void {
-            if (name === "library-changed")
-                page.refreshPlaylists();
+        target: LibraryCache
+        function onItemsChanged(): void {
+            if (page.loadedCollections.playlists)
+                page.playlists = LibraryCache.items;
         }
     }
 
@@ -93,41 +117,112 @@ Item {
         page.tab = k;
         if (page.opened.indexOf(k) < 0)
             page.opened = page.opened.concat([k]);
+        if (page.isCollectionTab(k)) {
+            page.loading = !page.loadedCollections[k];
+            page.loadCollection(k);
+        } else {
+            page.loading = false;
+        }
     }
     function isOpened(k) { return page.opened.indexOf(k) >= 0; }
+    function isCollectionTab(k) { return k === "playlists" || k === "albums" || k === "artists"; }
+
+    function setCollectionMap(map, key, value) {
+        var next = Object.assign({}, map);
+        next[key] = value;
+        return next;
+    }
+
+    function clearCollections(clearCache) {
+        page.collectionEpoch++;
+        if (clearCache)
+            LibraryData.clearCollectionCache();
+        page.playlists = [];
+        page.albums = [];
+        page.artists = [];
+        page.loadedCollections = ({});
+        page.loadingCollections = ({});
+        page.loading = page.isCollectionTab(page.tab);
+        page.errorMsg = "";
+    }
 
     function load() {
         // Gated: no daemon call, the sign-in card carries the page.
         if (page.spotifyGate) {
-            page.playlists = [];
-            page.albums = [];
-            page.artists = [];
-            page.errorMsg = "";
+            page.clearCollections();
             page.loading = false;
             return;
         }
-        page.loading = true;
         page.errorMsg = "";
-        Promise.all([
-            Daemon.call("get_library").catch(() => []),
-            Daemon.call("get_library_albums").catch(() => []),
-            Daemon.call("get_library_artists").catch(() => [])
-        ]).then((res) => {
-            page.playlists = res[0] || [];
-            page.albums = res[1] || [];
-            page.artists = res[2] || [];
+        if (page.isCollectionTab(page.tab)) {
+            page.loading = !page.loadedCollections[page.tab];
+            page.loadCollection(page.tab);
+        } else {
             page.loading = false;
+        }
+    }
+
+    function loadCollection(tab) {
+        if (!page.isCollectionTab(tab) || page.spotifyGate
+                || page.loadedCollections[tab] || page.loadingCollections[tab])
+            return;
+        var provider = Playback.provider;
+        if (tab !== "playlists") {
+            var cached = LibraryData.cachedCollection(provider, tab);
+            if (cached !== null) {
+                if (tab === "albums") page.albums = cached;
+                else page.artists = cached;
+                page.loadedCollections = page.setCollectionMap(page.loadedCollections, tab, true);
+                if (page.tab === tab)
+                    page.loading = false;
+                return;
+            }
+        }
+        var method = tab === "playlists" ? "get_library"
+            : tab === "albums" ? "get_library_albums" : "get_library_artists";
+        var epoch = page.collectionEpoch;
+        page.loadingCollections = page.setCollectionMap(page.loadingCollections, tab, true);
+        if (page.tab === tab)
+            page.loading = true;
+        page.errorMsg = "";
+        const request = method === "get_library" ? LibraryCache.load(false) : Daemon.call(method);
+        request.then((items) => {
+            if (epoch !== page.collectionEpoch)
+                return;
+            if (tab === "playlists") page.playlists = items || [];
+            else if (tab === "albums") {
+                page.albums = items || [];
+                LibraryData.rememberCollection(provider, tab, page.albums);
+            } else {
+                page.artists = items || [];
+                LibraryData.rememberCollection(provider, tab, page.artists);
+            }
+            page.loadedCollections = page.setCollectionMap(page.loadedCollections, tab, true);
+            page.loadingCollections = page.setCollectionMap(page.loadingCollections, tab, false);
+            if (page.tab === tab)
+                page.loading = false;
         }).catch((e) => {
-            page.errorMsg = (e && e.message) ? e.message : String(e);
-            page.loading = false;
+            if (epoch !== page.collectionEpoch)
+                return;
+            page.loadingCollections = page.setCollectionMap(page.loadingCollections, tab, false);
+            if (page.tab === tab) {
+                page.errorMsg = (e && e.message) ? e.message : String(e);
+                page.loading = false;
+            }
         });
     }
 
-    function refreshPlaylists() {
-        if (page.spotifyGate)
+    function refreshPlaylists(force) {
+        if (page.spotifyGate || (!force && !page.loadedCollections.playlists))
             return;
-        Daemon.call("get_library")
-            .then((r) => { page.playlists = r || []; })
+        var epoch = page.collectionEpoch;
+        LibraryCache.load(true)
+            .then((r) => {
+                if (epoch !== page.collectionEpoch)
+                    return;
+                page.playlists = r || [];
+                page.loadedCollections = page.setCollectionMap(page.loadedCollections, "playlists", true);
+            })
             .catch(() => {});
     }
 
@@ -137,7 +232,7 @@ Item {
             return;
         page.creating = true;
         Daemon.call("create_playlist", { title: title })
-            .then(() => { page.creating = false; page.newName = ""; newDialog.visible = false; page.load(); Playback.toast("Playlist created", "success"); })
+            .then(() => { page.creating = false; page.newName = ""; newDialog.visible = false; page.refreshPlaylists(true); Playback.toast("Playlist created", "success"); })
             .catch((e) => { page.creating = false; Playback.toast((e && e.message) ? e.message : "Could not create", "error"); });
     }
 
@@ -162,7 +257,7 @@ Item {
                             chain = chain.then(() => Daemon.call("add_to_playlist", { playlistId: id, videoId: song.video_id }).catch(() => {}));
                         })(transfer.items[i]);
                     }
-                    return chain.then(() => { page.load(); Playback.toast("Imported " + transfer.title, "success"); });
+                    return chain.then(() => { page.refreshPlaylists(true); Playback.toast("Imported " + transfer.title, "success"); });
                 });
             })
             .catch((e) => Playback.toast((e && e.message) ? e.message : "Could not import", "error"));
