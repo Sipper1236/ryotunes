@@ -78,11 +78,15 @@ Item {
             .then((more) => {
                 if (!root.pl || root.pl.continuation !== token)
                     return;
+                var scrollY = body.view ? body.view.contentY : 0;
                 root.pl = Object.assign({}, root.pl, {
                     items: root.pl.items.concat(more.items),
                     continuation: more.items.length ? more.continuation : undefined
                 });
                 root.loadingMore = false;
+                // ListView treats the replacement JS array as a new model and resets to its
+                // beginning. Keep the user's position while appending the next page.
+                Qt.callLater(() => { if (body.view) body.view.contentY = scrollY; });
             })
             .catch(() => { root.moreError = true; root.loadingMore = false; });
     }

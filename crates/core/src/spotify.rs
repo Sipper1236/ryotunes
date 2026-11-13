@@ -49,6 +49,28 @@ impl Provider {
 
 pub const SPOTIFY_TRACK_PREFIX: &str = "spotify:track:";
 pub const SPOTIFY_PLAYLIST_TOKEN_PREFIX: &str = "ryotunes:spotify-playlist:v1";
+pub const SPOTIFY_LIKED_TOKEN_PREFIX: &str = "ryotunes:spotify-liked:v1";
+
+/// Build the opaque continuation token for a Spotify liked-songs page.
+pub fn spotify_liked_continuation(page: u32, sort: &str, desc: bool) -> String {
+    format!("{SPOTIFY_LIKED_TOKEN_PREFIX}:{page}:{sort}:{}", u8::from(desc))
+}
+
+/// Decode a Spotify liked-songs continuation token, including its sort mode.
+pub fn parse_spotify_liked_continuation(token: &str) -> Option<(u32, &str, bool)> {
+    let mut parts = token.strip_prefix(SPOTIFY_LIKED_TOKEN_PREFIX)?.strip_prefix(':')?.split(':');
+    let page = parts.next()?.parse().ok()?;
+    let sort = parts.next()?;
+    if !matches!(sort, "default" | "newest" | "oldest" | "title" | "artist" | "album" | "top") {
+        return None;
+    }
+    let desc = match parts.next()? {
+        "0" => false,
+        "1" => true,
+        _ => return None,
+    };
+    parts.next().is_none().then_some((page, sort, desc))
+}
 
 /// Build the opaque continuation token for a Spotify metadata-only playlist.
 pub fn spotify_playlist_continuation(playlist_id: &str, page: u32) -> String {
@@ -77,7 +99,10 @@ pub fn spotify_track_id(id: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod playlist_page_tests {
-    use super::{parse_spotify_playlist_continuation, spotify_playlist_continuation};
+    use super::{
+        parse_spotify_liked_continuation, parse_spotify_playlist_continuation,
+        spotify_liked_continuation, spotify_playlist_continuation,
+    };
 
     #[test]
     fn playlist_page_tokens_round_trip_and_reject_invalid_ids() {
@@ -89,6 +114,17 @@ mod playlist_page_tests {
         assert!(parse_spotify_playlist_continuation("ryotunes:spotify-playlist:v1:nope:bad:id")
             .is_none());
         assert!(parse_spotify_playlist_continuation("ryotunes:spotify-playlist:v1:1:").is_none());
+    }
+
+    #[test]
+    fn liked_page_tokens_round_trip_and_reject_invalid_values() {
+        let token = spotify_liked_continuation(7, "newest", false);
+        assert_eq!(parse_spotify_liked_continuation(&token), Some((7, "newest", false)));
+        assert!(
+            parse_spotify_liked_continuation("ryotunes:spotify-liked:v1:bad:newest:0").is_none()
+        );
+        assert!(parse_spotify_liked_continuation("ryotunes:spotify-liked:v1:1:unknown:0").is_none());
+        assert!(parse_spotify_liked_continuation("ryotunes:spotify-liked:v1:1:newest:2").is_none());
     }
 }
 

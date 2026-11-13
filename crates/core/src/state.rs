@@ -1833,7 +1833,51 @@ impl AppState {
         // `webview.eval` if each one is announced. The final state is emitted after the loop.
         let mut last_emit: Option<std::time::Instant> = None;
         for _ in 0..MAX_PAGES {
-            let (mut items, continuation) = if let Some((playlist_id, page_num)) =
+            let (mut items, continuation) = if let Some((page_num, sort, desc)) =
+                crate::spotify::parse_spotify_liked_continuation(&token)
+            {
+                let Some(spotify) = self.spotify.client().await else {
+                    tracing::warn!(
+                        "Spotify liked-songs fill stopped because the account signed out"
+                    );
+                    break;
+                };
+                let sort = match sort {
+                    "default" => innertube::PlaylistSort::Default,
+                    "newest" => innertube::PlaylistSort::Newest,
+                    "oldest" => innertube::PlaylistSort::Oldest,
+                    "title" => innertube::PlaylistSort::Title,
+                    "artist" => innertube::PlaylistSort::Artist,
+                    "album" => innertube::PlaylistSort::Album,
+                    "top" => innertube::PlaylistSort::Top,
+                    _ => unreachable!("liked continuation parser validates sort"),
+                };
+                match spotify.liked(page_num).await {
+                    Ok(tracks) => {
+                        let page = crate::spotify_bridge::liked_page(&tracks, Some(sort), desc);
+                        let continuation = (page.items.len() >= 50).then(|| {
+                            crate::spotify::spotify_liked_continuation(
+                                page_num.saturating_add(1),
+                                match sort {
+                                    innertube::PlaylistSort::Default => "default",
+                                    innertube::PlaylistSort::Newest => "newest",
+                                    innertube::PlaylistSort::Oldest => "oldest",
+                                    innertube::PlaylistSort::Title => "title",
+                                    innertube::PlaylistSort::Artist => "artist",
+                                    innertube::PlaylistSort::Album => "album",
+                                    innertube::PlaylistSort::Top => "top",
+                                },
+                                desc,
+                            )
+                        });
+                        (page.items, continuation)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Spotify liked-songs fill stopped early");
+                        break;
+                    }
+                }
+            } else if let Some((playlist_id, page_num)) =
                 crate::spotify::parse_spotify_playlist_continuation(&token)
             {
                 let Some(spotify) = self.spotify.client().await else {

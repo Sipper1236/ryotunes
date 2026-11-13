@@ -217,11 +217,15 @@ Item {
                     return;
                 if (page.isSpotifyLiked)
                     LikedCache.put(token, more);
+                var scrollY = body.view ? body.view.contentY : 0;
                 page.pl = Object.assign({}, page.pl, {
                     items: page.pl.items.concat(more.items),
                     continuation: more.items.length ? more.continuation : undefined
                 });
                 page.loadingMore = false;
+                // ListView treats the replacement JS array as a new model and resets to its
+                // beginning. Keep the user's position while appending the next page.
+                Qt.callLater(() => { if (body.view) body.view.contentY = scrollY; });
             })
             .catch(() => { page.moreError = true; page.loadingMore = false; });
     }
