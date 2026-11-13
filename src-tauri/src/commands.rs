@@ -314,7 +314,7 @@ pub async fn seek(state: St<'_>, position: f64) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn set_volume(state: St<'_>, volume: i64) -> Result<(), String> {
-    state.set_volume(volume).await
+    state.set_volume(volume)
 }
 
 /// Tempo (0.25–2.0) and pitch (−12..=12 semitones), the "Advanced" dialog. Volatile by design:

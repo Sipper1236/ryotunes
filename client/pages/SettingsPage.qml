@@ -1014,38 +1014,9 @@ Item {
                     // Spotify metadata-only toggle
                     ToggleRow {
                         title: "Spotify free account (metadata only)"
-                        desc: "Use Spotify for search and library without Premium. Choose the audio player below."
+                        desc: "Use Spotify for search/browse/playlists but play via YouTube Music fallback. No Premium required. When off, Spotify playback needs Premium."
                         value: page.settings.spotify_metadata_only === "true"
                         onFlipped: (on) => page.setSetting("spotify_metadata_only", on ? "true" : "false")
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        visible: page.settings.spotify_metadata_only === "true"
-                        spacing: Style.sp(3)
-                        ColumnLayout {
-                            Layout.fillWidth: true
-                            spacing: 1
-                            Text { Layout.fillWidth: true; text: "Free-account playback"; color: Tokens.ink; font.family: Style.fontUi; font.pixelSize: Style.fs.md; font.weight: Font.Medium }
-                            Text {
-                                Layout.fillWidth: true
-                                text: "Automatic tries Spotify's official Web Player, then falls back to YouTube Music. Web Player needs a browser with Widevine DRM."
-                                color: Tokens.inkMuted; font.family: Style.fontUi; font.pixelSize: Style.fs.sm; wrapMode: Text.WordWrap
-                            }
-                        }
-                        RowLayout {
-                            Layout.alignment: Qt.AlignVCenter
-                            spacing: Style.sp(2)
-                            Repeater {
-                                model: [ { v: "auto", l: "Automatic" }, { v: "youtube", l: "YouTube only" } ]
-                                delegate: Chip {
-                                    required property var modelData
-                                    text: modelData.l
-                                    active: (page.settings.spotify_free_playback || "auto") === modelData.v
-                                    onClicked: page.setSetting("spotify_free_playback", modelData.v)
-                                }
-                            }
-                        }
                     }
                 }
 

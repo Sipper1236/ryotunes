@@ -71,10 +71,19 @@ For Ryotunes, the viable cross-platform option/fallback design is:
 
 On the inspected Ryotunes host, Chromium and Firefox are installed but no Widevine CDM was found under `/usr/lib` or `/opt`; the Ryotunes daemon uses WebKitGTK 2.54.2. WebKitGTK has EME support, but that does not provide a Widevine CDM. This is host-specific evidence and should be checked at runtime rather than assumed. ([WebKitGTK multimedia documentation](https://docs.webkit.org/Ports/WebKitGTK%20and%20WPE%20WebKit/Multimedia.html), [Widevine platform support](https://developers.google.com/widevine/drm/overview))
 
-## Ryotunes implementation on this branch
+## Ryotunes implementation decision
 
-The free-account playback setting now offers **Automatic** and **YouTube only**. Automatic tries the official Spotify Web Player through the GPL-licensed MySpoti/Orpheon page bridge over local Chromium CDP, and falls back to Ryotunes' existing duration-checked YouTube Music resolver when the browser, Widevine, account, or player cannot start the track. The Spotify page owns its own ads and protected audio; Ryotunes mirrors track state and routes transport controls to it. A later player failure marks that track for the current attempt and retries it through YouTube Music, avoiding an infinite retry loop. Metadata still uses Ryotunes' existing Pathfinder route.
+Ryotunes keeps Spotify free-account support metadata-only: Pathfinder supplies Spotify search and
+library data, while every Spotify song plays through the existing YouTube Music duration-checked
+fallback. The user rejected an external Spotify playback backend because launching a separate
+Spotify Web Player browser tab is surprising and does not provide integrated Ryotunes playback.
+The Chromium/CDP adapter explored during this comparison has therefore been removed from the
+branch. Quackify player code was not reused due to its conflicting license notices; Orpheon's
+Android WebView/DRM stack is not a drop-in Linux playback engine.
 
-This is deliberately a playback adapter, not a port of either project's native DRM engine. Quackify player code was not reused because of its conflicting license notices. The Chromium adapter is used by the daemon host; the legacy Tauri host reports the player unavailable and therefore follows the YouTube fallback.
-
-The daemon and core suites pass on the remote `rx580` host. This machine has no usable Widevine CDM, so live Spotify Web Player playback is not verified here; the intended runtime path on this host is automatic fallback to YouTube Music. The browser may be signed in through a supported browser cookie store; Ryotunes transfers only `sp_dc` to the private player profile.
+The existing fallback checks the selected queue row's Spotify ID, title, artist and duration,
+searches YouTube Music, chooses a close-duration candidate when available, and resolves that
+YouTube ID through the normal stream orchestrator. This host-specific branch run did not establish
+why a particular user's liked track failed after the external player attempt; the UI and daemon
+must be exercised together to confirm the fallback against that account and current YouTube
+availability.

@@ -12,7 +12,6 @@ mod login;
 mod methods;
 mod server;
 mod sink;
-mod spotify_web_player;
 mod tray;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;

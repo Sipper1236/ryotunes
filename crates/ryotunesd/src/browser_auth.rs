@@ -96,24 +96,6 @@ pub fn import_spotify_cookie() -> Option<String> {
     import_cookie_from(&discover(), "spotify", "spotify.com", "sp_dc")
 }
 
-/// Read Spotify's session cookie on demand, even if this process scanned the browser before the
-/// last login. Used only when starting the separate Web Player profile; the normal sign-in watcher
-/// keeps using the mtime-cached function above.
-pub fn read_spotify_cookie_from_browser() -> Option<String> {
-    for store in discover() {
-        let Some(cookies) = (match store.kind {
-            Kind::Gecko => read_gecko(&store.path, "spotify.com", &["sp_dc"]),
-            Kind::Chromium => read_chromium(&store.path, "spotify.com", &["sp_dc"]),
-        }) else {
-            continue;
-        };
-        if let Some(cookie) = harvest_cookie(cookies, "spotify.com", "sp_dc") {
-            return Some(cookie);
-        }
-    }
-    None
-}
-
 fn import_from(stores: &[Store]) -> Option<SoundcloudAuth> {
     for store in stores {
         if !changed_since_last_look(&store.path, "soundcloud") {

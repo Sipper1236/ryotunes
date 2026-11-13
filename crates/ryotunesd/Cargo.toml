@@ -18,10 +18,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
-futures-util = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ryotunes-core = { workspace = true }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 ryotunes-soundcloud = { path = "../soundcloud" }
 ryotunes-tidal = { path = "../tidal" }
 ryotunes-protocol = { workspace = true }
