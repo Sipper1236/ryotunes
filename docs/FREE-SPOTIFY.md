@@ -2,9 +2,20 @@
 
 Metadata mode opens Spotify in the system default browser, watches that browser's cookie store for
 the first-party `sp_dc` session cookie, exchanges it for a short-lived token, and uses Spotify's
-internal Pathfinder API for catalog data. It does not create a librespot session. Track playback
-continues through Ryotunes' YouTube Music resolver. Spotify can change these internal endpoints
-without notice; this integration is not a supported Spotify developer API.
+internal Pathfinder API for catalog data. It does not create a librespot session. Playback offers
+two modes under **Settings → Providers → Spotify free account (metadata only)**:
+
+- **Automatic** tries Spotify's official Web Player in a private Chromium/Chrome profile when a
+  local Widevine CDM is available. If the player or account refuses a track, Ryotunes resolves the
+  same track through YouTube Music and checks the match duration.
+- **YouTube only** skips the Spotify Web Player and uses the duration-checked YouTube Music match.
+
+Spotify's own ads and free-account restrictions apply to its Web Player. A browser without
+Widevine, a missing browser, player startup errors, or later playback failure use the YouTube
+fallback. The daemon looks for Chromium, Chrome, or Brave; set `RYOTUNES_SPOTIFY_BROWSER` to an
+executable path to select another Chromium-based browser. Spotify can change the internal
+Pathfinder and Web Player interfaces without notice; neither is a supported Spotify developer
+API.
 
 ## Spotify app setup
 
@@ -41,7 +52,9 @@ metadata-only web-session flow described above.
 
 - Spotify catalog search for tracks, albums, artists and playlists through Pathfinder
 - Track detail through Pathfinder
-- Spotify track playback through a duration-checked YouTube Music match
+- Automatic playback through Spotify's official Web Player with a duration-checked YouTube Music
+  fallback
+- YouTube-only playback through a duration-checked YouTube Music match
 - Saved library lists for tracks, albums, artists and playlists
 
 Metadata mode currently maps catalog search, track, album, artist and playlist detail, saved tracks,
@@ -49,7 +62,8 @@ saved albums, saved artists, and playlists through Pathfinder. Saving and removi
 Pathfinder library mutation. Playlist creation, renaming, visibility changes and track edits return
 an explicit unsupported-operation error in metadata mode. These internal calls still need a live
 free-account check. The Spotify home feed and lyrics are not implemented. Direct Spotify playback
-remains available in normal mode with Premium.
+remains available in normal mode with Premium. The legacy Tauri host does not embed the Chromium
+adapter and uses the YouTube fallback for metadata-mode playback.
 
 ## Credentials
 

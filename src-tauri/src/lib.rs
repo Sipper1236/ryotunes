@@ -408,6 +408,7 @@ pub fn run() {
                 db,
                 sink.clone(),
                 login,
+                Arc::new(ryotunes_core::host::UnavailableSpotifyWebPlayer),
                 paths,
                 orchestrator,
                 lt,
@@ -733,18 +734,15 @@ async fn handle_media_event(
     match event {
         MediaControlEvent::Play => state.resume().await,
         MediaControlEvent::Toggle => state.resume_or_toggle().await,
-        MediaControlEvent::Pause => {
-            let _ = state.player.pause();
-        }
+        MediaControlEvent::Pause => state.pause().await,
         MediaControlEvent::Stop => {
-            let _ = state.player.stop();
-            state.media_set_playing(false);
+            state.stop_playback().await;
             main_window::schedule_idle_exit(&app);
         }
         MediaControlEvent::Next => state.next_in_queue().await,
         MediaControlEvent::Previous => state.prev_in_queue().await,
         MediaControlEvent::SetPosition(MediaPosition(pos)) => {
-            let _ = state.player.seek(pos.as_secs_f64());
+            let _ = state.user_seek(pos.as_secs_f64()).await;
         }
         MediaControlEvent::SeekBy(dir, by) => {
             let delta = if matches!(dir, SeekDirection::Forward) {
@@ -752,11 +750,11 @@ async fn handle_media_event(
             } else {
                 -by.as_secs_f64()
             };
-            let _ = state.player.seek((state.current_position() + delta).max(0.0));
+            let _ = state.user_seek((state.current_position() + delta).max(0.0)).await;
         }
         MediaControlEvent::Seek(dir) => {
             let delta = if matches!(dir, SeekDirection::Forward) { 10.0 } else { -10.0 };
-            let _ = state.player.seek((state.current_position() + delta).max(0.0));
+            let _ = state.user_seek((state.current_position() + delta).max(0.0)).await;
         }
         _ => {}
     }

@@ -73,6 +73,62 @@ pub trait LoginFlow: Send + Sync + 'static {
     async fn sign_in(&self) -> Result<LoginResult, LoginError>;
 }
 
+/// Snapshot from Spotify's official Web Player when it owns audio for a free-account track.
+/// Position and duration are seconds. `track_uri` may be `None` while the page is loading or
+/// playing an ad; callers must not treat either state as a song-end event.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpotifyWebPlayerSnapshot {
+    pub track_uri: Option<String>,
+    pub position: f64,
+    pub duration: f64,
+    pub playing: bool,
+    pub loading: bool,
+    pub is_ad: bool,
+    pub error: Option<String>,
+}
+
+/// Host-owned Spotify Web Player adapter. The official player keeps DRM and ad playback inside
+/// its browser engine; the core only asks it to play/control a Spotify URI and mirrors state.
+#[async_trait::async_trait]
+pub trait SpotifyWebPlayer: Send + Sync + 'static {
+    async fn play(&self, track_uri: &str) -> Result<(), String>;
+    async fn pause(&self) -> Result<(), String>;
+    async fn resume(&self) -> Result<(), String>;
+    async fn seek(&self, position: f64) -> Result<(), String>;
+    async fn set_volume(&self, volume: i64) -> Result<(), String>;
+    async fn stop(&self) -> Result<(), String>;
+    async fn snapshot(&self) -> Result<SpotifyWebPlayerSnapshot, String>;
+}
+
+/// Used by hosts that have no CDP-capable browser adapter. Auto mode sees this as unavailable
+/// and falls through to the existing YouTube Music resolver.
+pub struct UnavailableSpotifyWebPlayer;
+
+#[async_trait::async_trait]
+impl SpotifyWebPlayer for UnavailableSpotifyWebPlayer {
+    async fn play(&self, _: &str) -> Result<(), String> {
+        Err("Spotify Web Player is unavailable in this host".into())
+    }
+    async fn pause(&self) -> Result<(), String> {
+        Err("Spotify Web Player is unavailable in this host".into())
+    }
+    async fn resume(&self) -> Result<(), String> {
+        Err("Spotify Web Player is unavailable in this host".into())
+    }
+    async fn seek(&self, _: f64) -> Result<(), String> {
+        Err("Spotify Web Player is unavailable in this host".into())
+    }
+    async fn set_volume(&self, _: i64) -> Result<(), String> {
+        Err("Spotify Web Player is unavailable in this host".into())
+    }
+    async fn stop(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn snapshot(&self) -> Result<SpotifyWebPlayerSnapshot, String> {
+        Err("Spotify Web Player is unavailable in this host".into())
+    }
+}
+
 /// Where the core keeps its files. The host resolves them (Tauri's `app_data_dir`, or XDG).
 #[derive(Debug, Clone)]
 pub struct Paths {

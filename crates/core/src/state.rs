@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 
 use crate::db::{now_secs, Db};
 use crate::discord::DiscordHandle;
-use crate::host::{EventSink, LoginFlow, Paths};
+use crate::host::{EventSink, LoginFlow, Paths, SpotifyWebPlayer};
 use crate::listentogether::{LtSession, SyncCommand};
 use crate::media::MediaHandle;
 use crate::orchestrator::{Orchestrator, PlaybackData, PlaybackPing, ResolveError};
@@ -65,7 +65,7 @@ pub const TIDAL_CREDENTIALS_KEY: &str = "tidal_credentials";
 /// into the renderer: they'd otherwise ship the login credential out on every open, and the
 /// renderer can't overwrite them either. Lives here so `settings_snapshot`, the Tauri host and the
 /// daemon share one list.
-pub const UI_SETTINGS: [&str; 16] = [
+pub const UI_SETTINGS: [&str; 17] = [
     "volume",
     "proxy",
     "quality",
@@ -82,6 +82,7 @@ pub const UI_SETTINGS: [&str; 16] = [
     "ui_scale",
     "low_resource_mode",
     "spotify_metadata_only",
+    "spotify_free_playback",
 ];
 
 /// Where the personal store (Home Shortcuts, sidebar pins, play recency, Home arrangement) lives:
@@ -109,6 +110,12 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub sink: Arc<dyn EventSink>,
     pub login: Arc<dyn LoginFlow>,
+    /// Optional host-owned Spotify Web Player; free-account playback can use it before YouTube.
+    spotify_web_player: Arc<dyn SpotifyWebPlayer>,
+    spotify_web_player_active: AtomicBool,
+    spotify_web_player_polling: AtomicBool,
+    spotify_web_player_snapshot: parking_lot::RwLock<crate::host::SpotifyWebPlayerSnapshot>,
+    spotify_web_player_failed_track: parking_lot::Mutex<Option<String>>,
     pub paths: Paths,
     pub orchestrator: Arc<Orchestrator>,
     /// Listen Together session (session protocol). Drives host broadcasts + guest gating.
@@ -513,6 +520,7 @@ impl AppState {
         db: Arc<Db>,
         sink: Arc<dyn EventSink>,
         login: Arc<dyn LoginFlow>,
+        spotify_web_player: Arc<dyn SpotifyWebPlayer>,
         paths: Paths,
         orchestrator: Arc<Orchestrator>,
         lt: Arc<LtSession>,
@@ -580,6 +588,13 @@ impl AppState {
             db,
             sink,
             login,
+            spotify_web_player,
+            spotify_web_player_active: AtomicBool::new(false),
+            spotify_web_player_polling: AtomicBool::new(false),
+            spotify_web_player_snapshot: parking_lot::RwLock::new(
+                crate::host::SpotifyWebPlayerSnapshot::default(),
+            ),
+            spotify_web_player_failed_track: parking_lot::Mutex::new(None),
             paths,
             orchestrator,
             lt,
@@ -1935,6 +1950,27 @@ impl AppState {
         if self.lt.is_guest().await {
             return; // guest playback is host-driven
         }
+        if self.spotify_web_player_active.load(Ordering::Acquire) {
+            let playing = self.spotify_web_player_snapshot.read().playing;
+            let result = if playing {
+                self.spotify_web_player.pause().await
+            } else {
+                self.spotify_web_player.resume().await
+            };
+            match result {
+                Ok(()) => {
+                    let mut snapshot = self.spotify_web_player_snapshot.write();
+                    snapshot.playing = !playing;
+                    self.media_set_playing(!playing);
+                    self.emit("playback-state", if playing { "paused" } else { "playing" });
+                }
+                Err(error) => {
+                    let gen = self.generation.load(Ordering::Acquire);
+                    self.fallback_from_spotify_web_player(gen, error).await;
+                }
+            }
+            return;
+        }
         if !self.player.has_loaded_media() {
             let (idx, has_items) = {
                 let q = self.queue.lock().await;
@@ -1955,6 +1991,20 @@ impl AppState {
         if self.lt.is_guest().await {
             return;
         }
+        if self.spotify_web_player_active.load(Ordering::Acquire) {
+            match self.spotify_web_player.resume().await {
+                Ok(()) => {
+                    self.spotify_web_player_snapshot.write().playing = true;
+                    self.media_set_playing(true);
+                    self.emit("playback-state", "playing");
+                }
+                Err(error) => {
+                    let gen = self.generation.load(Ordering::Acquire);
+                    self.fallback_from_spotify_web_player(gen, error).await;
+                }
+            }
+            return;
+        }
         if !self.player.has_loaded_media() {
             let (idx, has_items) = {
                 let q = self.queue.lock().await;
@@ -1966,6 +2016,45 @@ impl AppState {
             return;
         }
         let _ = self.player.play();
+    }
+
+    pub async fn pause(self: &std::sync::Arc<Self>) {
+        if self.spotify_web_player_active.load(Ordering::Acquire) {
+            match self.spotify_web_player.pause().await {
+                Ok(()) => {
+                    self.spotify_web_player_snapshot.write().playing = false;
+                    self.media_set_playing(false);
+                    self.emit("playback-state", "paused");
+                }
+                Err(error) => {
+                    let gen = self.generation.load(Ordering::Acquire);
+                    self.fallback_from_spotify_web_player(gen, error).await;
+                }
+            }
+        } else {
+            let _ = self.player.pause();
+        }
+    }
+
+    pub async fn stop_playback(self: &std::sync::Arc<Self>) {
+        self.spotify_web_player_active.store(false, Ordering::Release);
+        let _ = self.spotify_web_player.stop().await;
+        let _ = self.player.stop();
+        self.media_set_playing(false);
+    }
+
+    pub async fn seek_playback(&self, position: f64) -> Result<(), String> {
+        if !position.is_finite() || position < 0.0 {
+            return Err("Seek position must be a non-negative finite number.".into());
+        }
+        if self.spotify_web_player_active.load(Ordering::Acquire) {
+            self.spotify_web_player.seek(position).await?;
+            self.spotify_web_player_snapshot.write().position = position;
+            self.note_position_sample(position);
+            Ok(())
+        } else {
+            self.player.seek(position).map_err(|e| e.to_string())
+        }
     }
 
     /// Jump to a specific queue index.
@@ -2159,7 +2248,52 @@ impl AppState {
                 return false; // user moved on
             }
             let Some(item) = self.current_item().await else { return false };
-            let resolved = self.resolve_song(&item).await;
+            let free_playback = self.db.get_setting("spotify_free_playback");
+            let web_player_preferred = {
+                let failed_track = self.spotify_web_player_failed_track.lock();
+                should_try_spotify_web_player(
+                    self.spotify.is_metadata_only(),
+                    &item.video_id,
+                    free_playback.as_deref(),
+                    failed_track.as_deref(),
+                )
+            };
+            let resolved = if web_player_preferred {
+                let web_player_result = async {
+                    // Apply the saved level before Spotify makes the first frame audible.
+                    self.spotify_web_player.set_volume(saved_volume(&self.db)).await?;
+                    self.spotify_web_player.play(&item.video_id).await
+                }
+                .await;
+                match web_player_result {
+                    Ok(()) => {
+                        let duration_ms = parse_duration_ms(item.duration.as_deref());
+                        Ok(PlaybackData {
+                            video_id: item.video_id.clone(),
+                            stream_url: String::new(),
+                            itag: 0,
+                            mpv_options: Vec::new(),
+                            headers: std::collections::HashMap::new(),
+                            expires_in_seconds: 0,
+                            loudness_db: None,
+                            playback_ping: None,
+                            title: Some(item.title.clone()),
+                            artists: Some(item.artists.clone()),
+                            duration: (duration_ms > 0)
+                                .then(|| (duration_ms as f64 / 1000.0).to_string()),
+                            thumbnail: item.thumbnail.clone(),
+                            is_video: None,
+                            stream_client: "spotify-web-player".into(),
+                        })
+                    }
+                    Err(error) => {
+                        tracing::info!(video_id = %item.video_id, %error, "Spotify Web Player unavailable; using YouTube Music fallback");
+                        self.resolve_song(&item).await
+                    }
+                }
+            } else {
+                self.resolve_song(&item).await
+            };
             // A resolve takes seconds; a skip during it bumps the generation. Re-check before
             // acting on the result: an abandoned failure would otherwise move `current` under the
             // track that's already playing and leave a stale error banner (nothing clears it, the
@@ -2228,17 +2362,28 @@ impl AppState {
         if self.generation.load(Ordering::SeqCst) != gen {
             return false; // user moved on
         }
-        if let Err(e) = self.player.load(
-            &data.stream_url,
-            &data.headers,
-            loudness_gain(data.loudness_db),
-            &media_title(&item.title, &item.artists),
-            &data.mpv_options,
-        ) {
-            self.emit_error(&item.video_id, &e.to_string());
-            return false;
+        let spotify_web_player = data.stream_client == "spotify-web-player";
+        if spotify_web_player {
+            let _ = self.player.stop();
+            self.spotify_web_player_active.store(true, Ordering::Release);
+            *self.spotify_web_player_failed_track.lock() = None;
+            let snapshot = self.spotify_web_player.snapshot().await.unwrap_or_default();
+            *self.spotify_web_player_snapshot.write() = snapshot;
+        } else {
+            self.spotify_web_player_active.store(false, Ordering::Release);
+            let _ = self.spotify_web_player.stop().await;
+            if let Err(e) = self.player.load(
+                &data.stream_url,
+                &data.headers,
+                loudness_gain(data.loudness_db),
+                &media_title(&item.title, &item.artists),
+                &data.mpv_options,
+            ) {
+                self.emit_error(&item.video_id, &e.to_string());
+                return false;
+            }
+            let _ = self.player.play();
         }
-        let _ = self.player.play();
         // Resume a restored position, but only for the exact track it was saved against (any first
         // play consumes it, so jumping elsewhere doesn't inherit it). mpv queues an absolute seek
         // issued right after loadfile and applies it when the file loads.
@@ -2252,7 +2397,11 @@ impl AppState {
             .filter(|(vid, _)| *vid == item.video_id)
             .map(|(_, pos)| pos);
         if let Some(pos) = seek {
-            let _ = self.player.seek(pos);
+            if spotify_web_player {
+                let _ = self.spotify_web_player.seek(pos).await;
+            } else {
+                let _ = self.player.seek(pos);
+            }
         }
         // Items played from cards/radio can arrive without a duration; the player response knows
         // the exact length of the cut we stream. Backfill before emitting — lyrics matching keys
@@ -2285,7 +2434,14 @@ impl AppState {
                 }
             }
         }
-        if crate::spotify::is_spotify_id(&item.video_id) {
+        if spotify_web_player {
+            let snapshot = self.spotify_web_player.snapshot().await.unwrap_or_default();
+            *self.spotify_web_player_snapshot.write() = snapshot.clone();
+            if snapshot.duration.is_finite() && snapshot.duration > 0.0 {
+                self.on_duration(snapshot.duration).await;
+            }
+            self.record_position(snapshot.position.max(0.0));
+        } else if crate::spotify::is_spotify_id(&item.video_id) {
             // mpv can't measure a FIFO's length, so seed the duration from the queue item and push
             // it exactly like `on_duration` would (mpv's own `duration` events are ignored while a
             // Spotify track plays).
@@ -2304,6 +2460,9 @@ impl AppState {
         // Discord never learn the track started. After `emit_now_playing`, so the new track is the
         // current one before anything renders it as playing.
         self.media_set_playing(true);
+        if spotify_web_player {
+            self.spawn_spotify_web_player_monitor(gen);
+        }
         self.emit_queue().await;
         self.persist_queue().await;
         // Listen Together host: announce the new track (fresh play → position 0, playing).
@@ -2314,6 +2473,96 @@ impl AppState {
         let me = self.clone();
         tokio::spawn(async move { me.extend_queue_radio(gen).await });
         true
+    }
+
+    /// Mirror a host-owned Spotify Web Player into the same queue, position, MPRIS and history
+    /// state that mpv supplies for ordinary streams. The official page keeps protected audio and
+    /// ads inside its browser engine; an error here retries this track through YouTube Music.
+    fn spawn_spotify_web_player_monitor(self: &std::sync::Arc<Self>, gen: u64) {
+        if self.spotify_web_player_polling.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut previous = me.spotify_web_player_snapshot.read().clone();
+            loop {
+                if me.generation.load(Ordering::Acquire) != gen
+                    || !me.spotify_web_player_active.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                let snapshot = match me.spotify_web_player.snapshot().await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        me.fallback_from_spotify_web_player(gen, error).await;
+                        break;
+                    }
+                };
+                if let Some(error) = snapshot.error.clone() {
+                    me.fallback_from_spotify_web_player(gen, error).await;
+                    break;
+                }
+
+                *me.spotify_web_player_snapshot.write() = snapshot.clone();
+                if snapshot.position.is_finite() && snapshot.position >= 0.0 {
+                    me.on_position(snapshot.position).await;
+                    if previous.position.floor() != snapshot.position.floor() {
+                        me.emit("position", serde_json::json!({ "position": snapshot.position }));
+                    }
+                }
+                if snapshot.duration.is_finite()
+                    && snapshot.duration > 0.0
+                    && (snapshot.duration - previous.duration).abs() > 0.5
+                {
+                    me.on_duration(snapshot.duration).await;
+                    me.emit("duration", serde_json::json!({ "duration": snapshot.duration }));
+                }
+                if snapshot.playing != previous.playing {
+                    me.media_set_playing(snapshot.playing);
+                    me.emit("playback-state", if snapshot.playing { "playing" } else { "paused" });
+                    me.lt_on_play_state(snapshot.playing).await;
+                }
+
+                // An ad is owned by Spotify and may have no track URI. Do not interpret that
+                // transient state as the song ending. Only advance once the song's own duration
+                // has elapsed and the page is no longer loading it.
+                if !snapshot.loading
+                    && !snapshot.is_ad
+                    && snapshot.duration > 0.0
+                    && snapshot.position + 0.5 >= snapshot.duration
+                {
+                    me.spotify_web_player_active.store(false, Ordering::Release);
+                    me.spotify_web_player_polling.store(false, Ordering::Release);
+                    me.spotify_web_player_snapshot.write().playing = false;
+                    me.media_set_playing(false);
+                    me.emit("playback-state", "paused");
+                    me.on_track_ended().await;
+                    return;
+                }
+                previous = snapshot;
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+            me.spotify_web_player_polling.store(false, Ordering::Release);
+        });
+    }
+
+    async fn fallback_from_spotify_web_player(
+        self: &std::sync::Arc<Self>,
+        gen: u64,
+        reason: String,
+    ) {
+        if self.generation.load(Ordering::Acquire) != gen
+            || !self.spotify_web_player_active.swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        let Some(item) = self.current_item().await else { return };
+        *self.spotify_web_player_failed_track.lock() = Some(item.video_id.clone());
+        let _ = self.spotify_web_player.stop().await;
+        self.emit_notice(&format!("Spotify Web Player failed; trying YouTube Music ({reason})"));
+        if self.start_current(gen).await {
+            self.prime_lookahead(gen).await;
+        }
     }
 
     /// Resolve the next queue item and append it to mpv for a gapless transition.
@@ -2503,7 +2752,9 @@ impl AppState {
             (q.duration, q.items.get(q.current).cloned())
         };
         let playing = self.is_playing.load(Ordering::Relaxed);
-        let position = if use_live_player_position(item.is_some(), playing) {
+        let position = if self.spotify_web_player_active.load(Ordering::Acquire) {
+            self.current_position()
+        } else if use_live_player_position(item.is_some(), playing) {
             self.player.position().unwrap_or_else(|| self.current_position())
         } else {
             self.current_position()
@@ -2727,7 +2978,7 @@ impl AppState {
     /// Whether mpv still owns a loaded track that can be resumed without rebuilding playback.
     /// A paused track is therefore a live background session even though `is_playing()` is false.
     pub fn has_resumable_session(&self) -> bool {
-        self.player.has_loaded_media()
+        self.spotify_web_player_active.load(Ordering::Acquire) || self.player.has_loaded_media()
     }
 
     /// Advance/rewind the queue (OS "next"/"previous" keys + the UI's skip buttons). `play_index`
@@ -3545,7 +3796,7 @@ impl AppState {
         let position = position.max(0.0);
         // A Spotify track seeks like any other: librespot decodes the whole track into the FIFO
         // within seconds and mpv keeps it in its seekable cache.
-        self.player.seek(position).map_err(|e| e.to_string())?;
+        self.seek_playback(position).await?;
         if self.lt.is_host().await {
             self.lt
                 .broadcast_playback(Playback::at(PlaybackKind::Seek, (position * 1000.0) as i64))
@@ -4294,6 +4545,18 @@ fn shuffle_new_queue(items: &mut [SongItem], start: usize) -> usize {
     0
 }
 
+fn should_try_spotify_web_player(
+    metadata_only: bool,
+    video_id: &str,
+    playback_mode: Option<&str>,
+    failed_track: Option<&str>,
+) -> bool {
+    metadata_only
+        && crate::spotify::spotify_track_id(video_id).is_some()
+        && playback_mode != Some("youtube")
+        && failed_track != Some(video_id)
+}
+
 /// Parse a `"m:ss"` / `"h:mm:ss"` duration string to ms (0 if absent/unparseable).
 fn parse_duration_ms(s: Option<&str>) -> i64 {
     let Some(s) = s else { return 0 };
@@ -4594,11 +4857,14 @@ impl AppState {
         self.it.browse_grid(client, id, params).await.map_err(|e| e.to_string())
     }
 
-    pub fn set_volume(&self, volume: i64) -> Result<(), String> {
+    pub async fn set_volume(&self, volume: i64) -> Result<(), String> {
         if !(0..=100).contains(&volume) {
             return Err("Volume must be between 0 and 100.".into());
         }
         self.player.set_volume(volume).map_err(|e| e.to_string())?;
+        if self.spotify_web_player_active.load(Ordering::Acquire) {
+            self.spotify_web_player.set_volume(volume).await?;
+        }
         // There is one volume and there can be two windows (the mini player). Without this the one
         // that didn't move the slider keeps showing the old level and lies about what you're hearing.
         self.emit("volume", volume);
@@ -4651,14 +4917,25 @@ mod tests {
     use super::{
         append_page, backfill_metadata, drop_duplicates, enqueue_at, format_duration,
         guest_insert_index, is_mix, loudness_gain, merge_radio, next_index, parse_duration_ms,
-        persist_fingerprint, queue_fingerprint, radio_seed_for, read_personal, shuffle_new_queue,
-        shuffle_upcoming, splice_radio_into, spotify_fallback_metadata, spotify_mpv_options,
-        spotify_youtube_candidate, unshuffled, upcoming_queued, use_live_player_position,
-        validate_personal_blob, QueueState, RepeatMode, SongItem, SpotifyFallbackCache,
-        SpotifyFallbackMetadata, PERSONAL_JSON_KEY,
+        persist_fingerprint, queue_fingerprint, radio_seed_for, read_personal,
+        should_try_spotify_web_player, shuffle_new_queue, shuffle_upcoming, splice_radio_into,
+        spotify_fallback_metadata, spotify_mpv_options, spotify_youtube_candidate, unshuffled,
+        upcoming_queued, use_live_player_position, validate_personal_blob, QueueState, RepeatMode,
+        SongItem, SpotifyFallbackCache, SpotifyFallbackMetadata, PERSONAL_JSON_KEY,
     };
     use crate::db::Db;
     use crate::orchestrator::PlaybackData;
+
+    #[test]
+    fn spotify_free_playback_prefers_web_player_then_falls_back_per_track() {
+        let id = "spotify:track:0123456789ABCDEFGHIJKL";
+        assert!(should_try_spotify_web_player(true, id, Some("auto"), None));
+        assert!(should_try_spotify_web_player(true, id, None, None));
+        assert!(!should_try_spotify_web_player(true, id, Some("youtube"), None));
+        assert!(!should_try_spotify_web_player(true, id, Some("auto"), Some(id)));
+        assert!(!should_try_spotify_web_player(false, id, Some("auto"), None));
+        assert!(!should_try_spotify_web_player(true, "youtube-video-id", Some("auto"), None));
+    }
 
     #[test]
     fn spotify_fallback_cache_preserves_player_data_and_expires_before_the_url() {

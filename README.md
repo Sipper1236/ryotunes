@@ -139,13 +139,14 @@ Ryotunes supports Spotify **free (non-Premium) listener accounts** through a met
 - **Settings → Providers** → enable **Spotify free account (metadata only)**, then sign in under **Settings → Account**
 - Sign-in opens your default browser and imports Spotify's `sp_dc` session cookie for the Pathfinder metadata API; no developer app is needed for metadata-only mode
 - Browse/search: Spotify search, saved tracks/albums, playlists, artist and album pages
-- Playback: each Spotify track resolves via YouTube Music automatically (duration-verified match)
+- Playback: **Automatic** tries Spotify's official Web Player when Chromium/Chrome with Widevine is available, then falls back to a duration-verified YouTube Music match; **YouTube only** skips the Web Player
 - Premium users: keep metadata-only **off** for direct Spotify streaming via librespot
 
 Metadata mode requires a Spotify web sign-in. The internal endpoints may change without notice;
 see [`docs/FREE-SPOTIFY.md`](docs/FREE-SPOTIFY.md) for current feature coverage and limitations.
-The setting persists across restarts. Spotify's personalized Home feed and lyrics are unavailable
-in metadata mode.
+The metadata and playback preferences persist across restarts. Spotify's own ads and free-account
+restrictions apply to Web Player playback. Spotify's personalized Home feed and lyrics are
+unavailable in metadata mode.
 
 ### Home in the primary QML client
 

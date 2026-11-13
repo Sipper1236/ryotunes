@@ -493,7 +493,7 @@ impl Dispatch for Methods {
                 null()
             }
             "set_volume" => {
-                st.set_volume(arg(&params, "volume")?).map_err(err)?;
+                st.set_volume(arg(&params, "volume")?).await.map_err(err)?;
                 null()
             }
             "set_playback_params" => {
@@ -2558,6 +2558,9 @@ fn normalize_ui_setting(key: &str, raw: &str) -> Result<String, String> {
         "spotify_metadata_only" => matches!(raw, "true" | "false")
             .then(|| raw.to_owned())
             .ok_or_else(|| format!("{key} must be true or false.")),
+        "spotify_free_playback" => matches!(raw, "auto" | "youtube")
+            .then(|| raw.to_owned())
+            .ok_or_else(|| "Spotify free playback must be auto or youtube.".into()),
         _ => Err(format!("unknown setting: {key}")),
     }
 }
@@ -2736,6 +2739,14 @@ mod tests {
         assert!(normalize_ui_setting("spotify_metadata_only", "1").is_err());
         assert!(normalize_ui_setting("spotify_metadata_only", "").is_err());
         assert!(normalize_ui_setting("spotify_metadata_only", "maybe").is_err());
+    }
+
+    #[test]
+    fn spotify_free_playback_setting_accepts_supported_modes() {
+        assert_eq!(normalize_ui_setting("spotify_free_playback", "auto").unwrap(), "auto");
+        assert_eq!(normalize_ui_setting("spotify_free_playback", "youtube").unwrap(), "youtube");
+        assert!(normalize_ui_setting("spotify_free_playback", "native").is_err());
+        assert!(normalize_ui_setting("spotify_free_playback", "").is_err());
     }
 }
 

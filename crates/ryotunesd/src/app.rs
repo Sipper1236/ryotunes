@@ -168,6 +168,7 @@ pub fn build(
         db,
         sink_dyn,
         login,
+        Arc::new(crate::spotify_web_player::CdpSpotifyWebPlayer::new(data_dir.clone())),
         paths,
         orchestrator,
         lt,
@@ -371,18 +372,15 @@ async fn handle_media_event(
     match event {
         MediaControlEvent::Play => state.resume().await,
         MediaControlEvent::Toggle => state.resume_or_toggle().await,
-        MediaControlEvent::Pause => {
-            let _ = state.player.pause();
-        }
+        MediaControlEvent::Pause => state.pause().await,
         MediaControlEvent::Stop => {
-            let _ = state.player.stop();
-            state.media_set_playing(false);
+            state.stop_playback().await;
             lifecycle.playing_changed(false);
         }
         MediaControlEvent::Next => state.next_in_queue().await,
         MediaControlEvent::Previous => state.prev_in_queue().await,
         MediaControlEvent::SetPosition(MediaPosition(pos)) => {
-            let _ = state.player.seek(pos.as_secs_f64());
+            let _ = state.user_seek(pos.as_secs_f64()).await;
         }
         MediaControlEvent::SeekBy(dir, by) => {
             let delta = if matches!(dir, SeekDirection::Forward) {
@@ -390,11 +388,11 @@ async fn handle_media_event(
             } else {
                 -by.as_secs_f64()
             };
-            let _ = state.player.seek((state.current_position() + delta).max(0.0));
+            let _ = state.user_seek((state.current_position() + delta).max(0.0)).await;
         }
         MediaControlEvent::Seek(dir) => {
             let delta = if matches!(dir, SeekDirection::Forward) { 10.0 } else { -10.0 };
-            let _ = state.player.seek((state.current_position() + delta).max(0.0));
+            let _ = state.user_seek((state.current_position() + delta).max(0.0)).await;
         }
         _ => {}
     }
