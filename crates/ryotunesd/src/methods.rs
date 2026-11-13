@@ -80,6 +80,7 @@ const SPOTIFY_DISPLAY_NAME_KEY: &str = "spotify_display_name";
 const SPOTIFY_LIKED_PAGE: usize = 50;
 const SPOTIFY_PLAYLIST_PAGE: usize = 50;
 const SPOTIFY_LIKED_TOKEN_PREFIX: &str = "ryotunes:spotify-liked:v1";
+const SPOTIFY_LIKED_CACHE_TTL_SECS: i64 = 120;
 
 fn spotify_liked_token(page: u32, sort: PlaylistSort, desc: bool) -> String {
     let sort = match sort {
@@ -113,6 +114,23 @@ fn parse_spotify_liked_token(token: &str) -> Option<(u32, PlaylistSort, bool)> {
         _ => return None,
     };
     parts.next().is_none().then_some((page, sort, desc))
+}
+
+fn spotify_liked_cache_key(page: u32, sort: PlaylistSort, desc: bool) -> String {
+    format!("spotify:liked:{}", spotify_liked_token(page, sort, desc))
+}
+
+fn cached_spotify_liked_page(st: &Arc<AppState>, key: &str) -> Option<Value> {
+    let page = st.db.get_spotify_liked_page(key, ryotunes_core::db::now_secs())?;
+    serde_json::from_str(&page).ok()
+}
+
+fn cache_spotify_liked_page(st: &Arc<AppState>, key: &str, page: &Value) {
+    st.db.put_spotify_liked_page(
+        key,
+        &page.to_string(),
+        ryotunes_core::db::now_secs() + SPOTIFY_LIKED_CACHE_TTL_SECS,
+    );
 }
 
 fn spotify_liked_can_page(metadata_only: bool, sort: Option<PlaylistSort>, desc: bool) -> bool {
@@ -531,6 +549,7 @@ impl Dispatch for Methods {
             }
             "clear_caches" => {
                 let rotate = arg::<Option<bool>>(&params, "rotate")?.unwrap_or(true);
+                st.db.clear_spotify_liked_pages();
                 let refreshed = st.clear_caches(rotate).await;
                 ok(json!({ "visitorDataRefreshed": refreshed }))
             }
@@ -617,6 +636,7 @@ impl Dispatch for Methods {
                     match result {
                         Ok(()) => {
                             let name = spotify_name(&task).await;
+                            task.db.clear_spotify_liked_pages();
                             task.emit(
                                 "spotify-auth",
                                 json!({
@@ -642,6 +662,7 @@ impl Dispatch for Methods {
             }
             "spotify_sign_out" => {
                 st.spotify.sign_out().await;
+                st.db.clear_spotify_liked_pages();
                 st.db.delete_setting(SPOTIFY_DISPLAY_NAME_KEY);
                 st.emit("spotify-auth", json!({ "state": "signed_out" }));
                 ok(json!({ "signedIn": false }))
@@ -822,6 +843,7 @@ impl Dispatch for Methods {
                         .set_track_saved(tid, matches!(rating, Rating::Like))
                         .await
                         .map_err(spotify_err)?;
+                    st.db.clear_spotify_liked_pages();
                     st.emit("liked-songs-changed", json!({}));
                     return null();
                 }
@@ -864,6 +886,7 @@ impl Dispatch for Methods {
                         .ok_or_else(|| spotify_err("Not a Spotify track."))?;
                     if pid == "liked" {
                         client.set_track_saved(tid, true).await.map_err(spotify_err)?;
+                        st.db.clear_spotify_liked_pages();
                         st.emit("liked-songs-changed", json!({}));
                     } else {
                         client.add_track_to_playlist(pid, tid).await.map_err(spotify_err)?;
@@ -908,6 +931,7 @@ impl Dispatch for Methods {
                         .ok_or_else(|| spotify_err("Not a Spotify track."))?;
                     if pid == "liked" {
                         client.set_track_saved(tid, false).await.map_err(spotify_err)?;
+                        st.db.clear_spotify_liked_pages();
                         st.emit("liked-songs-changed", json!({}));
                     } else {
                         client.remove_track_from_playlist(pid, tid).await.map_err(spotify_err)?;
@@ -1473,6 +1497,10 @@ async fn spotify_playlist(
     let client = st.spotify.client().await.ok_or_else(spotify_signed_out)?;
     if pid == "liked" {
         let selected_sort = sort.unwrap_or(PlaylistSort::Newest);
+        let cache_key = spotify_liked_cache_key(0, selected_sort, desc);
+        if let Some(page) = cached_spotify_liked_page(st, &cache_key) {
+            return Ok(page);
+        }
         if !spotify_liked_can_page(st.spotify.is_metadata_only(), sort, desc) {
             let mut tracks = Vec::new();
             let mut page = 0u32;
@@ -1485,7 +1513,9 @@ async fn spotify_playlist(
                 }
                 page += 1;
             }
-            return ok(spotify_bridge::liked_page(&tracks, Some(selected_sort), desc));
+            let page = ok(spotify_bridge::liked_page(&tracks, Some(selected_sort), desc))?;
+            cache_spotify_liked_page(st, &cache_key, &page);
+            return Ok(page);
         }
 
         let tracks = client.liked(0).await.map_err(spotify_err)?;
@@ -1495,6 +1525,7 @@ async fn spotify_playlist(
         } else {
             Value::Null
         };
+        cache_spotify_liked_page(st, &cache_key, &page);
         Ok(page)
     } else {
         if spotify_playlist_can_page(st.spotify.is_metadata_only(), sort, desc) {
@@ -1531,14 +1562,20 @@ async fn spotify_liked_more(st: &Arc<AppState>, token: &str) -> Result<Value, Er
     let (page, sort, desc) = parse_spotify_liked_token(token)
         .ok_or_else(|| err("That Spotify liked-songs page token is invalid."))?;
     let client = st.spotify.client().await.ok_or_else(spotify_signed_out)?;
+    let cache_key = spotify_liked_cache_key(page, sort, desc);
+    if let Some(page) = cached_spotify_liked_page(st, &cache_key) {
+        return Ok(page);
+    }
     let tracks = client.liked(page).await.map_err(spotify_err)?;
     let continuation = (tracks.len() >= SPOTIFY_LIKED_PAGE)
         .then(|| spotify_liked_token(page.saturating_add(1), sort, desc));
     let page = ok(spotify_bridge::liked_page(&tracks, Some(sort), desc))?;
-    Ok(json!({
+    let result = json!({
         "items": page.get("items").cloned().unwrap_or_else(|| json!([])),
         "continuation": continuation,
-    }))
+    });
+    cache_spotify_liked_page(st, &cache_key, &result);
+    Ok(result)
 }
 
 async fn spotify_album(st: &Arc<AppState>, id: &str) -> Result<Value, ErrorBody> {
@@ -1790,6 +1827,7 @@ async fn set_setting(st: &Arc<AppState>, params: &Value) -> Result<Value, ErrorB
         let changed = st.spotify.is_metadata_only() != metadata_only;
         st.spotify.set_metadata_only(metadata_only).await;
         if changed {
+            st.db.clear_spotify_liked_pages();
             st.db.delete_setting(SPOTIFY_DISPLAY_NAME_KEY);
             st.emit("spotify-auth", json!({ "state": "signed_out" }));
         }

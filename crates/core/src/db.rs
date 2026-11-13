@@ -112,6 +112,11 @@ impl Db {
                 station_json TEXT NOT NULL,
                 updated_at   INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS spotify_liked_page_cache (
+                cache_key  TEXT PRIMARY KEY,
+                page_json  TEXT NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
             "#,
         )?;
         // Migrate databases that predate the loudness_db column. Errors ("duplicate column")
@@ -273,6 +278,44 @@ impl Db {
             |r| r.get(0),
         )
         .ok()
+    }
+
+    // --- Spotify liked-page cache -------------------------------------------------------------
+
+    /// Cached Spotify liked-song metadata. A short expiry handles edits made in Spotify itself;
+    /// local like/auth changes explicitly clear the table.
+    pub fn get_spotify_liked_page(&self, cache_key: &str, now: i64) -> Option<String> {
+        let conn = self.0.lock().unwrap();
+        conn.query_row(
+            "SELECT page_json FROM spotify_liked_page_cache WHERE cache_key = ?1 AND expires_at > ?2",
+            rusqlite::params![cache_key, now],
+            |r| r.get(0),
+        )
+        .ok()
+    }
+
+    pub fn put_spotify_liked_page(&self, cache_key: &str, page_json: &str, expires_at: i64) {
+        let conn = self.0.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO spotify_liked_page_cache(cache_key, page_json, expires_at)
+             VALUES(?1, ?2, ?3)
+             ON CONFLICT(cache_key) DO UPDATE SET
+                page_json = excluded.page_json,
+                expires_at = excluded.expires_at",
+            rusqlite::params![cache_key, page_json, expires_at],
+        );
+        let _ = conn.execute(
+            "DELETE FROM spotify_liked_page_cache
+             WHERE expires_at <= ?1 OR cache_key NOT IN (
+                SELECT cache_key FROM spotify_liked_page_cache ORDER BY expires_at DESC LIMIT 64
+             )",
+            [now_secs()],
+        );
+    }
+
+    pub fn clear_spotify_liked_pages(&self) {
+        let conn = self.0.lock().unwrap();
+        let _ = conn.execute("DELETE FROM spotify_liked_page_cache", []);
     }
 
     // --- stream url cache -------------------------------------------------------------------
@@ -1109,6 +1152,22 @@ mod tests {
         d.record_play("stale", "{}", 1_000, 60);
         d.record_play("fresh", "{}", 5_000, 60); // prunes anything before 4_940
         assert_eq!(d.top_plays(0, 20), vec![("{}".to_string(), 1)]);
+    }
+
+    #[test]
+    fn spotify_liked_pages_expire_and_clear() {
+        let d = db();
+        let now = now_secs();
+        d.put_spotify_liked_page("page-1", r#"{"items":[1]}"#, now + 2);
+        assert_eq!(
+            d.get_spotify_liked_page("page-1", now + 1).as_deref(),
+            Some(r#"{"items":[1]}"#)
+        );
+        assert_eq!(d.get_spotify_liked_page("page-1", now + 2), None);
+
+        d.put_spotify_liked_page("page-1", r#"{"items":[2]}"#, now + 3);
+        d.clear_spotify_liked_pages();
+        assert_eq!(d.get_spotify_liked_page("page-1", now + 2), None);
     }
 
     #[test]
